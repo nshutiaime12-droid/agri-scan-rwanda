@@ -85,10 +85,13 @@ def get_supabase() -> Client | None:
 @st.cache_resource(show_spinner=False)
 def init_earth_engine() -> bool:
     try:
-        sa_email = os.environ.get("EE_SERVICE_ACCOUNT")
-        key_path  = os.environ.get("EE_PRIVATE_KEY_PATH")
-        if sa_email and key_path:
-            credentials = ee.ServiceAccountCredentials(sa_email, key_path)
+        import json
+        key_json = st.secrets.get("EE_PRIVATE_KEY_JSON")
+        if key_json:
+            key_data = json.loads(key_json)
+            credentials = ee.ServiceAccountCredentials(
+                key_data["client_email"], key_data=key_data
+            )
             ee.Initialize(credentials, project=EE_PROJECT)
         else:
             ee.Initialize(project=EE_PROJECT)
