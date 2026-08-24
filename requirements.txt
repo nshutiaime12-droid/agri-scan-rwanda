@@ -1,0 +1,6 @@
+streamlit>=1.35,<2.0
+earthengine-api>=0.1.400,<1.0
+folium>=0.17,<1.0
+streamlit-folium>=0.20,<1.0
+supabase>=2.5,<3.0
+pandas>=2.0,<3.0
