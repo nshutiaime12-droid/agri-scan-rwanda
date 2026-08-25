@@ -87,9 +87,11 @@ def init_earth_engine() -> bool:
     try:
         import json, base64
         if "gcp_service_account" in st.secrets:
+            import json
             key_data = dict(st.secrets["gcp_service_account"])
+            key_json_str = json.dumps(key_data)
             credentials = ee.ServiceAccountCredentials(
-                key_data["client_email"], key_data=key_data
+                key_data["client_email"], key_data=key_json_str
             )
             ee.Initialize(credentials, project=EE_PROJECT)
         else:
