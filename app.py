@@ -88,7 +88,10 @@ def init_earth_engine() -> bool:
         import json, base64
         key_b64 = st.secrets.get("EE_KEY_BASE64")
         if key_b64:
-            key_data = json.loads(base64.b64decode(key_b64).decode("utf-8"))
+            if isinstance(key_b64, dict):
+                key_data = key_b64  # Streamlit already parsed it
+            else:
+                key_data = json.loads(base64.b64decode(str(key_b64)).decode("utf-8"))
             credentials = ee.ServiceAccountCredentials(
                 key_data["client_email"], key_data=key_data
             )
