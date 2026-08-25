@@ -86,12 +86,8 @@ def get_supabase() -> Client | None:
 def init_earth_engine() -> bool:
     try:
         import json, base64
-        key_b64 = st.secrets.get("EE_KEY_BASE64")
-        if key_b64:
-            if isinstance(key_b64, dict):
-                key_data = key_b64  # Streamlit already parsed it
-            else:
-                key_data = json.loads(base64.b64decode(str(key_b64)).decode("utf-8"))
+        if "gcp_service_account" in st.secrets:
+            key_data = dict(st.secrets["gcp_service_account"])
             credentials = ee.ServiceAccountCredentials(
                 key_data["client_email"], key_data=key_data
             )
