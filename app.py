@@ -83,11 +83,11 @@ def get_supabase() -> Client | None:
 
 
 @st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def init_earth_engine() -> bool:
     try:
-        import json, base64
+        import json
         if "gcp_service_account" in st.secrets:
-            import json
             key_data = dict(st.secrets["gcp_service_account"])
             key_json_str = json.dumps(key_data)
             credentials = ee.ServiceAccountCredentials(
@@ -102,9 +102,6 @@ def init_earth_engine() -> bool:
         logger.error("Earth Engine init failed: %s", exc)
         return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: str) -> None:
     map_id_dict = ee.Image(ee_image).getMapId(vis_params)
     folium.TileLayer(
