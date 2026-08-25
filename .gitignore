@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .env
+earth-engine-key.json
+ee-key.json
