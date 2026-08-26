@@ -89,9 +89,14 @@ def get_supabase() -> Client | None:
 @st.cache_resource(show_spinner=False)
 def init_earth_engine() -> bool:
     try:
-        import json
-        key_json = st.secrets.get("EE_PRIVATE_KEY_JSON")
-        if key_json:
+        if "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            credentials = ee.ServiceAccountCredentials(
+                creds_dict["client_email"], key_data=json.dumps(creds_dict)
+            )
+            ee.Initialize(credentials, project=EE_PROJECT)
+        elif "EE_PRIVATE_KEY_JSON" in st.secrets:
+            key_json = st.secrets.get("EE_PRIVATE_KEY_JSON")
             key_data = json.loads(key_json)
             credentials = ee.ServiceAccountCredentials(
                 key_data["client_email"], key_data=key_data
@@ -586,7 +591,7 @@ def main() -> None:
                     if plot_z_val < SEVERE_STRESS_ZSCORE:
                         pc3.metric("Condition", "Severe Stress 🔴", delta="Action needed", delta_color="inverse")
                     elif plot_z_val < -0.5:
-                        pc3.metric("Condition", "Mild Stress 🟡",   delta="Monitor",       delta_color="off")
+                        pc3.metric("Condition", "Mild Stress 🟡",   delta="Monitor",      delta_color="off")
                     else:
                         pc3.metric("Condition", "Healthy 🟢",        delta="Good vigor")
         except Exception as exc:
@@ -698,16 +703,16 @@ def main() -> None:
         st.sidebar.warning(f"GeoJSON unavailable: {exc}")
 
     summary = pd.DataFrame([{
-        "District":               district,
-        "Sector":                 sector,
-        "Season":                 "Wet" if wet else "Dry",
-        "Start Date":             start_date,
-        "End Date":               end_date,
-        "Total Cropland km²":     total_cropland_km2,
-        "Stressed Cropland km²":  stress_km2,
-        "Stressed Cropland %":    stress_pct,
-        "Alert Level":            alert_label,
-        "Baseline NDVI":          round(baseline_mean, 3),
+        "District":                 district,
+        "Sector":                   sector,
+        "Season":                   "Wet" if wet else "Dry",
+        "Start Date":               start_date,
+        "End Date":                 end_date,
+        "Total Cropland km²":       total_cropland_km2,
+        "Stressed Cropland km²":    stress_km2,
+        "Stressed Cropland %":      stress_pct,
+        "Alert Level":              alert_label,
+        "Baseline NDVI":            round(baseline_mean, 3),
     }])
     st.sidebar.download_button(
         "⬇ Summary (CSV)",
