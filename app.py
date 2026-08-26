@@ -216,7 +216,7 @@ def compute_ndvi_anomaly(
     current = s2_ndvi.select("NDVI").filterDate(str(start), str(end)).median().updateMask(combined_mask)
 
     # Z-Score Image: (Current - Mean) / StdDev (clipping std deviation minimum to avoid division by zero)
-    z_score = current.subtract(mean_img).divide(std_img.max(0.01)).clip(roi)
+    z_score = current.subtract(mean_img).divide(std_img.max(0.01)).rename('z_score').clip(roi)
 
     stress_mask = z_score.lt(SEVERE_STRESS_ZSCORE)
     area_dict   = (
@@ -578,7 +578,7 @@ def main() -> None:
                     reducer=ee.Reducer.mean(), geometry=farm_geom,
                     scale=10, maxPixels=1e8,
                 ).getInfo()
-                plot_z_val = plot_stats.get("NDVI")  # Z-score band is named NDVI or z-score
+                plot_z_val = plot_stats.get("z_score")
 
                 st.markdown("### 🎯 Specific Plot Analytics")
                 pc1, pc2, pc3 = st.columns(3)
