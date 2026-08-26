@@ -187,14 +187,14 @@ def compute_ndvi_anomaly(
     wet     = _is_wet_season(start, end)
 
     if wet:
-        baseline_ic = s2_ndvi.select("NDVI").filterDate("2022-01-01", "2024-12-31").filter(
+        baseline_ic = s2_ndvi.select("NDVI").filterDate("2019-01-01", "2024-12-31").filter(
             ee.Filter.Or(
                 ee.Filter.calendarRange(3, 5, "month"),
                 ee.Filter.calendarRange(10, 12, "month"),
             )
         )
     else:
-        baseline_ic = s2_ndvi.select("NDVI").filterDate("2022-01-01", "2024-12-31").filter(
+        baseline_ic = s2_ndvi.select("NDVI").filterDate("2019-01-01", "2024-12-31").filter(
             ee.Filter.Or(
                 ee.Filter.calendarRange(1, 2, "month"),
                 ee.Filter.calendarRange(6, 9, "month"),
@@ -204,7 +204,7 @@ def compute_ndvi_anomaly(
     # Compute baseline mean and standard deviation for Z-Score framework
     masked_baseline = baseline_ic.map(lambda img: img.updateMask(combined_mask))
     mean_img = masked_baseline.mean()
-    std_img  = masked_baseline.reduce(ee.Reducer.stdDev())
+    std_img  = masked_baseline.reduce(ee.Reducer.stdDev()).rename("NDVI")
 
     baseline_stats = mean_img.reduceRegion(
         reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
@@ -303,14 +303,14 @@ def get_ndvi_timeseries(
     df = df.groupby("date")["NDVI"].mean().reset_index().sort_values("date").set_index("date")
 
     if wet:
-        baseline_ic = s2.filterDate("2022-01-01", "2024-12-31").filter(
+        baseline_ic = s2.filterDate("2019-01-01", "2024-12-31").filter(
             ee.Filter.Or(
                 ee.Filter.calendarRange(3, 5, "month"),
                 ee.Filter.calendarRange(10, 12, "month"),
             )
         )
     else:
-        baseline_ic = s2.filterDate("2022-01-01", "2024-12-31").filter(
+        baseline_ic = s2.filterDate("2019-01-01", "2024-12-31").filter(
             ee.Filter.Or(
                 ee.Filter.calendarRange(1, 2, "month"),
                 ee.Filter.calendarRange(6, 9, "month"),
