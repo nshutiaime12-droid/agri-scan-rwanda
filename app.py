@@ -1,7 +1,8 @@
 """
-Agri-Scan Rwanda — v3.0
+Agri-Scan Rwanda — v3.0 (Z-Score Framework)
 Changes from v2:
   - Percentage-based stress thresholds (>15% = High Alert, 5-15% = Moderate, <5% = Stable)
+  - Statistical Z-Score Anomaly Framework (< -1.0 std dev from historical baseline)
   - Dynamic total cropland area computed per district via ESA WorldCover
   - KPI shows both km² and % of total cropland
   - Chart y-axis fixed to show only relevant NDVI range (no wasted space)
@@ -42,11 +43,14 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_XUoeoM27WFCugu3pRL
 EE_PROJECT   = os.environ.get("EE_PROJECT",   "proven-record-503516-h2")
 
 DISTRICT_SECTORS: dict[str, list[str]] = {
-    "Rubavu":  ["Gisenyi", "Rugerero", "Rubavu", "Kanama", "Nyamyumba", "Cyanzarwe", "Bugeshi"],
+    "Rubavu":    ["Gisenyi", "Rugerero", "Rubavu", "Kanama", "Nyamyumba", "Cyanzarwe", "Bugeshi"],
     "Rutsiro": ["Gihango", "Kigeyo", "Kivumu", "Murunda", "Musasa", "Ruhango", "Boneza"],
     "Nyabihu": ["Bigogwe", "Jenda", "Mukamira", "Rambura", "Rugera", "Shyira"],
     "Musanze": ["Muhoza", "Cyuve", "Gacaca", "Gashaki", "Gataraga", "Kinigi", "Shingiro"],
-    "Kigali":  ["Nyarugenge", "Kicukiro", "Gasabo"],
+    "Kigali":    ["Nyarugenge", "Kicukiro", "Gasabo"],
+    "Kayonza":   ["Mukarange", "Ruramira", "Nyamirama", "Kabare", "Gahini", "Murama", "Rukara"],
+    "Nyagatare": ["Nyagatare", "Tabagwe", "Karama", "Matimba", "Rwempasha", "Musheri", "Mimuli"],
+    "Kirehe":    ["Kirehe", "Gahara", "Nyamugari", "Mahama", "Mpanga", "Musaza", "Kigarama"]
 }
 
 SECTOR_BBOX: dict[str, list[list[float]]] = {
@@ -59,12 +63,12 @@ SECTOR_BBOX: dict[str, list[list[float]]] = {
     "Bugeshi":   [[29.375,-1.710],[29.430,-1.710],[29.430,-1.665],[29.375,-1.665],[29.375,-1.710]],
 }
 
-SEVERE_STRESS_THRESHOLD = -0.15
-MILD_STRESS_THRESHOLD   =  0.0
-SOC_CONVERSION_FACTOR   = 10.0
-MAX_CLOUD_PCT           = 30
-WET_MONTHS              = {3, 4, 5, 10, 11, 12}
-WORLDCOVER_CROPLAND     = 40
+# Z-Score Thresholds (FAO / WMO Standard Framework)
+SEVERE_STRESS_ZSCORE = -1.0  # Standard deviations below historical mean
+SOC_CONVERSION_FACTOR  = 10.0
+MAX_CLOUD_PCT          = 30
+WET_MONTHS             = {3, 4, 5, 10, 11, 12}
+WORLDCOVER_CROPLAND    = 40
 
 # Alert thresholds as % of total cropland
 HIGH_ALERT_PCT     = 15.0
@@ -83,15 +87,14 @@ def get_supabase() -> Client | None:
 
 
 @st.cache_resource(show_spinner=False)
-@st.cache_resource(show_spinner=False)
 def init_earth_engine() -> bool:
     try:
         import json
-        if "gcp_service_account" in st.secrets:
-            key_data = dict(st.secrets["gcp_service_account"])
-            key_json_str = json.dumps(key_data)
+        key_json = st.secrets.get("EE_PRIVATE_KEY_JSON")
+        if key_json:
+            key_data = json.loads(key_json)
             credentials = ee.ServiceAccountCredentials(
-                key_data["client_email"], key_data=key_json_str
+                key_data["client_email"], key_data=key_data
             )
             ee.Initialize(credentials, project=EE_PROJECT)
         else:
@@ -102,6 +105,9 @@ def init_earth_engine() -> bool:
         logger.error("Earth Engine init failed: %s", exc)
         return False
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: str) -> None:
     map_id_dict = ee.Image(ee_image).getMapId(vis_params)
     folium.TileLayer(
@@ -152,7 +158,7 @@ def _add_ndvi(img: ee.Image) -> ee.Image:
     return img.addBands(ndvi)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EE COMPUTATIONS
+# EE COMPUTATIONS (Z-SCORE FRAMEWORK)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_ndvi_anomaly(
     roi: ee.Geometry,
@@ -190,19 +196,24 @@ def compute_ndvi_anomaly(
             )
         )
 
-    baseline = baseline_ic.median()
-    current  = s2_ndvi.select("NDVI").filterDate(str(start), str(end)).median()
+    # Compute baseline mean and standard deviation for Z-Score framework
+    masked_baseline = baseline_ic.map(lambda img: img.updateMask(combined_mask))
+    mean_img = masked_baseline.mean()
+    std_img  = masked_baseline.reduce(ee.Reducer.stdDev())
 
-    baseline_stats = baseline.updateMask(combined_mask).reduceRegion(
+    baseline_stats = mean_img.reduceRegion(
         reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
     )
     baseline_mean = float(
         ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
     )
 
-    anomaly = current.subtract(baseline).updateMask(combined_mask).clip(roi)
+    current = s2_ndvi.select("NDVI").filterDate(str(start), str(end)).median().updateMask(combined_mask)
 
-    stress_mask = anomaly.lt(SEVERE_STRESS_THRESHOLD)
+    # Z-Score Image: (Current - Mean) / StdDev (clipping std deviation minimum to avoid division by zero)
+    z_score = current.subtract(mean_img).divide(std_img.max(0.01)).clip(roi)
+
+    stress_mask = z_score.lt(SEVERE_STRESS_ZSCORE)
     area_dict   = (
         ee.Image.pixelArea().divide(1e6)
         .updateMask(stress_mask)
@@ -212,12 +223,12 @@ def compute_ndvi_anomaly(
         float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
     )
 
-    return anomaly, stress_km2, baseline_mean
+    return z_score, stress_km2, baseline_mean
 
 
 def compute_rain_anomaly(roi: ee.Geometry, start: date, end: date) -> ee.Image:
     chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(roi)
-    current_sum    = chirps.filterDate(str(start), str(end)).select("precipitation").sum()
+    current_sum     = chirps.filterDate(str(start), str(end)).select("precipitation").sum()
     historical_avg = (
         chirps.filterDate("2020-01-01", "2024-12-31").select("precipitation").sum().divide(5)
     )
@@ -318,19 +329,19 @@ def get_ndvi_timeseries(
 NDVI_LEGEND_HTML = """
 <div style="
     position: fixed; top: 80px; right: 10px;
-    width: 220px; padding: 12px; border-radius: 6px;
+    width: 230px; padding: 12px; border-radius: 6px;
     border: 2px solid #555; background: rgba(255,255,255,0.95);
     font-size: 12px; font-family: sans-serif; z-index: 9999;
     box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
-  <b>Crop Vigor Anomaly</b>
+  <b>Vegetation Z-Score Anomaly</b>
   <span style="color:#555;font-size:10px;"> (cropland only)</span><br><br>
-  <span style="display:inline-block;width:14px;height:14px;background:#d7191c;margin-right:6px;border-radius:2px;"></span>Severe Stress (&lt;&minus;0.15)<br>
-  <span style="display:inline-block;width:14px;height:14px;background:#fdae61;margin-right:6px;border-radius:2px;"></span>Mild Stress<br>
-  <span style="display:inline-block;width:14px;height:14px;background:#ffffbf;margin-right:6px;border-radius:2px;border:1px solid #ccc;"></span>Normal / Baseline<br>
-  <span style="display:inline-block;width:14px;height:14px;background:#abd9e9;margin-right:6px;border-radius:2px;"></span>Good Vigor<br>
-  <span style="display:inline-block;width:14px;height:14px;background:#2c7bb6;margin-right:6px;border-radius:2px;"></span>High Vigor (&gt;+0.15)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#d7191c;margin-right:6px;border-radius:2px;"></span>Severe Stress (&lt;&minus;1.0 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#fdae61;margin-right:6px;border-radius:2px;"></span>Mild Stress (&minus;1.0 to &minus;0.5 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#ffffbf;margin-right:6px;border-radius:2px;border:1px solid #ccc;"></span>Normal (&plusmn;0.5 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#abd9e9;margin-right:6px;border-radius:2px;"></span>Good Vigor (+0.5 to +1.0 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#2c7bb6;margin-right:6px;border-radius:2px;"></span>High Vigor (&gt;+1.0 &sigma;)<br>
   <hr style="margin:6px 0;border-color:#ddd;">
-  <span style="font-size:10px;color:#666;">Sentinel-2 SR · ESA WorldCover 10m</span>
+  <span style="font-size:10px;color:#666;">Sentinel-2 Z-Score · ESA WorldCover</span>
 </div>
 """
 
@@ -342,7 +353,7 @@ def main() -> None:
     st.title("🌾 Agri-Scan Rwanda: Crop Health & Climate Intelligence")
     st.markdown(
         "Real-time Earth Observation & Food Security Monitoring — "
-        "Sentinel-2 · CHIRPS · SoilGrids · ESA WorldCover"
+        "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover"
     )
 
     ee_ok = init_earth_engine()
@@ -380,7 +391,7 @@ def main() -> None:
 
     st.sidebar.markdown("---")
     st.sidebar.header("🛰️ Map Layers")
-    show_ndvi = st.sidebar.checkbox("Crop Vigor Anomaly (Sentinel-2)", value=True)
+    show_ndvi = st.sidebar.checkbox("Crop Vigor Z-Score Anomaly (Sentinel-2)", value=True)
     show_rain = st.sidebar.checkbox("Rainfall Anomaly % (CHIRPS)",    value=False)
     show_soc  = st.sidebar.checkbox("Soil Organic Carbon (SoilGrids)", value=False)
 
@@ -393,7 +404,7 @@ def main() -> None:
     season_label   = "🌧️ Wet Season" if wet else "☀️ Dry Season"
 
     # ── EE Computations ──────────────────────────────────────────────────────
-    with st.spinner("Computing cropland NDVI anomaly…"):
+    with st.spinner("Computing cropland Z-Score anomaly…"):
         ndvi_anomaly, stress_km2, baseline_mean = compute_ndvi_anomaly(roi, start_date, end_date)
 
     with st.spinner("Computing total cropland area…"):
@@ -444,7 +455,7 @@ def main() -> None:
         alert_color = "normal"
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Selected Area",         location_label)
+    k1.metric("Selected Area",        location_label)
     k2.metric("Season",                season_label)
     k3.metric(
         "Cropland Stress",
@@ -494,9 +505,9 @@ def main() -> None:
     if show_ndvi and ndvi_anomaly is not None:
         add_ee_layer(
             fmap, ndvi_anomaly,
-            {"min": -0.3, "max": 0.3,
+            {"min": -2.0, "max": 2.0,
              "palette": ["d7191c", "fdae61", "ffffbf", "abd9e9", "2c7bb6"]},
-            "Crop Vigor Anomaly",
+            "Crop Vigor Z-Score Anomaly",
         )
 
     if show_rain:
@@ -538,7 +549,7 @@ def main() -> None:
     lc4.metric("UPI Parcel ID",       upi     or "Draw on map")
 
     # ── Plot analytics ────────────────────────────────────────────────────────
-    plot_ndvi_val: float | None = None
+    plot_z_val: float | None = None
 
     if map_data and map_data.get("last_active_drawing"):
         st.sidebar.success("✅ Custom farm boundary active")
@@ -562,19 +573,19 @@ def main() -> None:
                     reducer=ee.Reducer.mean(), geometry=farm_geom,
                     scale=10, maxPixels=1e8,
                 ).getInfo()
-                plot_ndvi_val = plot_stats.get("NDVI")
+                plot_z_val = plot_stats.get("NDVI")  # Z-score band is named NDVI or z-score
 
                 st.markdown("### 🎯 Specific Plot Analytics")
                 pc1, pc2, pc3 = st.columns(3)
                 pc1.metric("Plot Area", f"{round(plot_area_ha, 2)} ha")
                 pc2.metric(
-                    "Mean Vigor Anomaly",
-                    f"{round(plot_ndvi_val, 3)}" if plot_ndvi_val is not None else "N/A",
+                    "Z-Score Anomaly",
+                    f"{round(plot_z_val, 2)} σ" if plot_z_val is not None else "N/A",
                 )
-                if plot_ndvi_val is not None:
-                    if plot_ndvi_val < SEVERE_STRESS_THRESHOLD:
+                if plot_z_val is not None:
+                    if plot_z_val < SEVERE_STRESS_ZSCORE:
                         pc3.metric("Condition", "Severe Stress 🔴", delta="Action needed", delta_color="inverse")
-                    elif plot_ndvi_val < MILD_STRESS_THRESHOLD:
+                    elif plot_z_val < -0.5:
                         pc3.metric("Condition", "Mild Stress 🟡",   delta="Monitor",       delta_color="off")
                     else:
                         pc3.metric("Condition", "Healthy 🟢",        delta="Good vigor")
@@ -620,7 +631,7 @@ def main() -> None:
                 "- **Field inspection:** Dispatch extension agents.\n"
                 "- **Irrigation:** Prioritise deficit zones.\n"
                 "- **Fertiliser:** Check nitrogen in stressed parcels.\n"
-                "- **Context:** FAO threshold for intervention is >15% cropland stressed."
+                "- **Context:** FAO Z-score threshold triggered (< -1.0σ)."
             )
         elif stress_pct > MODERATE_ALERT_PCT:
             st.info(
@@ -648,10 +659,10 @@ def main() -> None:
 
     with fc1:
         st.markdown("#### 🚦 Simple Field Status")
-        if plot_ndvi_val is not None:
-            if plot_ndvi_val < SEVERE_STRESS_THRESHOLD:
+        if plot_z_val is not None:
+            if plot_z_val < SEVERE_STRESS_ZSCORE:
                 st.error("🔴 **Urgent:** Heavy crop stress. Check moisture or pests immediately.")
-            elif plot_ndvi_val < MILD_STRESS_THRESHOLD:
+            elif plot_z_val < -0.5:
                 st.warning("🟡 **Caution:** Growth slowing. Check soil nutrients or water.")
             else:
                 st.success("🟢 **Thriving:** Crops healthy. Keep up regular management!")
@@ -663,7 +674,7 @@ def main() -> None:
         sms = f"Agri-Scan [{location_label}] {season_label}: "
         if stress_pct > HIGH_ALERT_PCT:
             sms += (
-                f"🔴 {stress_pct}% of cropland ({stress_km2} km²) under severe stress. "
+                f"🔴 {stress_pct}% of cropland ({stress_km2} km²) under severe Z-score stress. "
                 "Contact your Umurenge agronomist immediately."
             )
         elif stress_pct > MODERATE_ALERT_PCT:
@@ -707,8 +718,8 @@ def main() -> None:
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
-        "Agri-Scan Rwanda v3.0 · Nshuti Aimé · IUSS Pavia\n\n"
-        "Sentinel-2 SR · UCSB CHIRPS · ISRIC SoilGrids 2.0 · ESA WorldCover 10m"
+        "Agri-Scan Rwanda v3.0 (Z-Score) · Nshuti Aimé · IUSS Pavia\n\n"
+        "Sentinel-2 Z-Score · UCSB CHIRPS · ISRIC SoilGrids 2.0 · ESA WorldCover 10m"
     )
 
 
