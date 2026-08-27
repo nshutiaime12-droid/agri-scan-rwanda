@@ -235,6 +235,64 @@ def get_soc_layer(roi: ee.Geometry) -> ee.Image:
         .clip(roi)
     )
 
+def compute_rain_stats(roi: ee.Geometry, start: date, end: date) -> tuple[float, str]:
+    """
+    Mean rainfall anomaly % over the ROI.
+    Returns (anomaly_pct, status_label).
+    """
+    try:
+        chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(roi)
+        current_sum    = chirps.filterDate(str(start), str(end)).select("precipitation").sum()
+        historical_avg = chirps.filterDate("2020-01-01","2024-12-31").select("precipitation").sum().divide(5)
+        anomaly_img    = current_sum.subtract(historical_avg).divide(historical_avg).multiply(100).clip(roi)
+        stats = anomaly_img.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=5000, maxPixels=1e8
+        )
+        val = ee.Number(stats.get("precipitation", ee.Number(0))).getInfo()
+        pct = round(float(val or 0), 1)
+        if pct < -20:
+            label = "🔴 Rainfall Deficit"
+        elif pct < -10:
+            label = "🟡 Below Normal"
+        elif pct > 20:
+            label = "🔵 Above Normal"
+        else:
+            label = "🟢 Near Normal"
+        return pct, label
+    except Exception:
+        return 0.0, "—"
+
+
+def compute_soc_stats(roi: ee.Geometry) -> tuple[float, str]:
+    """
+    Mean soil organic carbon (g/kg) over cropland in the ROI.
+    FAO thresholds: <20 = Low, 20-40 = Medium, >40 = High
+    """
+    try:
+        crop_mask = _get_cropland_mask(roi)
+        soc = (
+            ee.Image("projects/soilgrids-isric/soc_mean")
+            .select("soc_0-5cm_mean")
+            .divide(SOC_CONVERSION_FACTOR)
+            .updateMask(crop_mask)
+            .clip(roi)
+        )
+        stats = soc.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=250, maxPixels=1e8
+        )
+        val = ee.Number(stats.get("soc_0-5cm_mean", ee.Number(0))).getInfo()
+        soc_val = round(float(val or 0), 1)
+        if soc_val < 20:
+            label = "🔴 Low SOC (<20 g/kg)"
+        elif soc_val < 40:
+            label = "🟡 Medium SOC (20-40 g/kg)"
+        else:
+            label = "🟢 High SOC (>40 g/kg)"
+        return soc_val, label
+    except Exception:
+        return 0.0, "—"
+
+
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_total_cropland_km2(district: str, sector: str = "All Sectors", cell: str | None = None) -> float:
     roi, _ = build_roi(district, sector, cell)
@@ -391,6 +449,8 @@ def main() -> None:
         stress_pct = round((stress_km2 / total_cropland_km2 * 100), 1) if total_cropland_km2 > 0 else 0.0
         rain_anomaly = compute_rain_anomaly(roi, start_date, end_date)
         soc_layer = get_soc_layer(roi)
+        rain_pct, rain_label = compute_rain_stats(roi, start_date, end_date) if show_rain else (0.0, "—")
+        soc_val, soc_label   = compute_soc_stats(roi) if show_soc else (0.0, "—")
 
     # UPI / Parcel Lookup
     map_center = [-1.9403, 29.8739]
@@ -432,6 +492,15 @@ def main() -> None:
     k2.metric("Season", season_label)
     k3.metric("Cropland Stress", f"{stress_km2} km²  ({stress_pct}%)", delta=alert_label, delta_color=alert_color)
     k4.metric("Total Cropland Area", f"{total_cropland_km2} km²", delta=f"Baseline NDVI {round(baseline_mean, 3)}" if baseline_mean else "—")
+
+    if show_rain or show_soc:
+        kr1, kr2 = st.columns(2)
+        if show_rain:
+            kr1.metric("Rainfall Anomaly", f"{rain_pct}%", delta=rain_label,
+                       delta_color="inverse" if rain_pct < -20 else ("off" if rain_pct < -10 else "normal"))
+        if show_soc:
+            kr2.metric("Soil Organic Carbon", f"{soc_val} g/kg", delta=soc_label,
+                       delta_color="inverse" if soc_val < 20 else ("off" if soc_val < 40 else "normal"))
 
     st.markdown("---")
 
