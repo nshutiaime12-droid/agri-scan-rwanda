@@ -400,6 +400,8 @@ cell_geoms = _load_cell_geometries()
 cell_options = ["All Cells"] + sorted(list(cell_geoms.keys()))
 selected_cell = st.sidebar.selectbox("Cell (Akagari)", cell_options)
 cell = None if selected_cell == "All Cells" else selected_cell
+
+st.sidebar.markdown("---")
 village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
 
     st.sidebar.markdown("---")
