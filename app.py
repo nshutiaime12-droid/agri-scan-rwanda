@@ -401,13 +401,13 @@ cell_options = ["All Cells"] + sorted(list(cell_geoms.keys()))
 selected_cell = st.sidebar.selectbox("Cell (Akagari)", cell_options)
 cell = None if selected_cell == "All Cells" else selected_cell
 
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(("---")
 village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
 
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(("---")
     upi_input = st.sidebar.text_input("🆔 UPI (Parcel ID)", placeholder="e.g., 3/03/04/01/123")
 
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(("---")
     st.sidebar.header("📅 Date Range")
     default_end   = date.today() - timedelta(days=1)
     default_start = default_end.replace(month=1, day=1)
@@ -418,7 +418,7 @@ village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe
         st.sidebar.error("Start date must be before end date.")
         st.stop()
 
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(("---")
     st.sidebar.header("🛰️ Map Layers")
     show_ndvi = st.sidebar.checkbox("Crop Vigor Z-Score Anomaly (Sentinel-2)", value=True)
     show_rain = st.sidebar.checkbox("Rainfall Anomaly % (CHIRPS)",    value=False)
@@ -713,7 +713,7 @@ village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe
         st.info(sms)
 
     # ── Exports ───────────────────────────────────────────────────────────────
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(("---")
     st.sidebar.header("📥 Export")
 
     try:
@@ -745,7 +745,7 @@ village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe
         mime="text/csv",
     )
 
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(("---")
     st.sidebar.caption(
         "Agri-Scan Rwanda v3.0 (Z-Score) · Nshuti Aimé · IUSS Pavia\n\n"
         "Sentinel-2 Z-Score · UCSB CHIRPS · ISRIC SoilGrids 2.0 · ESA WorldCover 10m"
