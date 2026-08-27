@@ -204,7 +204,7 @@ def compute_ndvi_anomaly(
     # Compute baseline mean and standard deviation for Z-Score framework
     masked_baseline = baseline_ic.map(lambda img: img.updateMask(combined_mask))
     mean_img = masked_baseline.mean()
-    std_img  = masked_baseline.reduce(ee.Reducer.stdDev()).rename("NDVI")
+    std_img  = masked_baseline.reduce(ee.Reducer.stdDev()).rename("NDVI").rename("NDVI")
 
     baseline_stats = mean_img.reduceRegion(
         reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
