@@ -255,9 +255,13 @@ def get_soc_layer(roi: ee.Geometry) -> ee.Image:
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def get_total_cropland_km2(district: str) -> float:
-    """Total ESA WorldCover cropland area for the district in km². Cached 24 h."""
-    roi, _ = build_roi(district, "All Sectors")
+def get_total_cropland_km2(district: str, sector: str = "All Sectors") -> float:
+    """
+    Total ESA WorldCover cropland area for the selected ROI in km².
+    When a sector is selected, computes over the sector — not the whole district.
+    Cached 24 h.
+    """
+    roi, _ = build_roi(district, sector)
     crop_mask = _get_cropland_mask(roi)
     area_dict = (
         ee.Image.pixelArea().divide(1e6)
@@ -418,7 +422,7 @@ def main() -> None:
         ndvi_anomaly, stress_km2, baseline_mean = compute_ndvi_anomaly(roi, start_date, end_date)
 
     with st.spinner("Computing total cropland area…"):
-        total_cropland_km2 = get_total_cropland_km2(district)
+        total_cropland_km2 = get_total_cropland_km2(district, sector)
 
     stress_pct   = round((stress_km2 / total_cropland_km2 * 100), 1) if total_cropland_km2 > 0 else 0.0
     rain_anomaly = compute_rain_anomaly(roi, start_date, end_date)
@@ -474,7 +478,7 @@ def main() -> None:
         delta_color=alert_color,
     )
     k4.metric(
-        "Total District Cropland",
+        "Total Cropland Area",
         f"{total_cropland_km2} km²",
         delta=f"Baseline NDVI {round(baseline_mean, 3)}" if baseline_mean else "—",
     )
