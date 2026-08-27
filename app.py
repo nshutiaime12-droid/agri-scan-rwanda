@@ -1,3 +1,12 @@
+
+_CELL_GEOM_PATH = os.path.join(os.path.dirname(__file__), "rwanda_cells.json")
+@lru_cache(maxsize=1)
+def _load_cell_geometries() -> dict:
+    try:
+        with open(_CELL_GEOM_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
 """
 Agri-Scan Rwanda — v3.0 (Z-Score Framework)
 Changes from v2:
@@ -386,7 +395,11 @@ def main() -> None:
     sector   = st.sidebar.selectbox(
         "Sector (Umurenge)", ["All Sectors"] + DISTRICT_SECTORS[district]
     )
-    cell    = st.sidebar.text_input("Cell (Akagari)",     placeholder="e.g., Amahoro")
+    # Dynamic cell selection from geoBoundaries ADM4
+cell_geoms = _load_cell_geometries()
+cell_options = ["All Cells"] + sorted(list(cell_geoms.keys()))
+selected_cell = st.sidebar.selectbox("Cell (Akagari)", cell_options)
+cell = None if selected_cell == "All Cells" else selected_cell
     village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
 
     st.sidebar.markdown("---")
