@@ -116,7 +116,7 @@ def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: s
         control=True,
     ).add_to(fmap)
 
-def build_roi(district: str, sector: str) -> tuple[ee.Geometry, bool]:
+def build_roi(district: str, sector: str, cell: str | None = None) -> tuple[ee.Geometry, bool]:
     gaul = ee.FeatureCollection("FAO/GAUL/2015/level2")
     district_geom = gaul.filter(
         ee.Filter.And(
@@ -124,6 +124,12 @@ def build_roi(district: str, sector: str) -> tuple[ee.Geometry, bool]:
             ee.Filter.eq("ADM2_NAME", district),
         )
     ).geometry()
+
+    if cell and cell != "All Cells":
+        cell_geoms = _load_cell_geometries()
+        if cell in cell_geoms:
+            candidate = ee.Geometry(cell_geoms[cell])
+            return district_geom.intersection(candidate, maxError=1), True
 
     if sector and sector != "All Sectors":
         sector_geoms = _load_sector_geometries()
@@ -230,8 +236,8 @@ def get_soc_layer(roi: ee.Geometry) -> ee.Image:
     )
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def get_total_cropland_km2(district: str, sector: str = "All Sectors") -> float:
-    roi, _ = build_roi(district, sector)
+def get_total_cropland_km2(district: str, sector: str = "All Sectors", cell: str | None = None) -> float:
+    roi, _ = build_roi(district, sector, cell)
     crop_mask = _get_cropland_mask(roi)
     area_dict = (
         ee.Image.pixelArea().divide(1e6)
@@ -374,14 +380,14 @@ def main() -> None:
     show_rain = st.sidebar.checkbox("Rainfall Anomaly % (CHIRPS)",    value=False)
     show_soc  = st.sidebar.checkbox("Soil Organic Carbon (SoilGrids)", value=False)
 
-    roi, is_sector_mode = build_roi(district, sector)
-    location_label = sector if is_sector_mode else district
+    roi, is_sector_mode = build_roi(district, sector, cell)
+    location_label = cell if (cell and cell != 'All Cells') else (sector if is_sector_mode else district)
     wet            = _is_wet_season(start_date, end_date)
     season_label   = "🌧️ Wet Season" if wet else "☀️ Dry Season"
 
     with st.spinner("Computing geospatial indicators..."):
         ndvi_anomaly, stress_km2, baseline_mean = compute_ndvi_anomaly(roi, start_date, end_date)
-        total_cropland_km2 = get_total_cropland_km2(district, sector)
+        total_cropland_km2 = get_total_cropland_km2(district, sector, cell)
         stress_pct = round((stress_km2 / total_cropland_km2 * 100), 1) if total_cropland_km2 > 0 else 0.0
         rain_anomaly = compute_rain_anomaly(roi, start_date, end_date)
         soc_layer = get_soc_layer(roi)
