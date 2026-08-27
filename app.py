@@ -400,7 +400,7 @@ cell_geoms = _load_cell_geometries()
 cell_options = ["All Cells"] + sorted(list(cell_geoms.keys()))
 selected_cell = st.sidebar.selectbox("Cell (Akagari)", cell_options)
 cell = None if selected_cell == "All Cells" else selected_cell
-    village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
+village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
 
     st.sidebar.markdown("---")
     upi_input = st.sidebar.text_input("🆔 UPI (Parcel ID)", placeholder="e.g., 3/03/04/01/123")
@@ -572,7 +572,7 @@ cell = None if selected_cell == "All Cells" else selected_cell
     lc1, lc2, lc3, lc4 = st.columns(4)
     lc1.metric("Sector (Umurenge)",   location_label)
     lc2.metric("Cell (Akagari)",      cell    or "Not specified")
-    lc3.metric("Village (Umudugudu)", village or "Not specified")
+village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
     lc4.metric("UPI Parcel ID",       upi     or "Draw on map")
 
     # ── Plot analytics ────────────────────────────────────────────────────────
