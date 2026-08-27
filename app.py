@@ -12,6 +12,7 @@ Changes from v2:
 import os
 import json
 import logging
+from functools import lru_cache
 from datetime import date, timedelta
 
 import ee
@@ -53,15 +54,17 @@ DISTRICT_SECTORS: dict[str, list[str]] = {
     "Kirehe":    ["Kirehe", "Gahara", "Nyamugari", "Mahama", "Mpanga", "Musaza", "Kigarama"]
 }
 
-SECTOR_BBOX: dict[str, list[list[float]]] = {
-    "Gisenyi":   [[29.255,-1.705],[29.285,-1.705],[29.285,-1.675],[29.255,-1.675],[29.255,-1.705]],
-    "Rugerero":  [[29.290,-1.730],[29.325,-1.730],[29.325,-1.700],[29.290,-1.700],[29.290,-1.730]],
-    "Rubavu":    [[29.310,-1.690],[29.350,-1.690],[29.350,-1.650],[29.310,-1.650],[29.310,-1.690]],
-    "Kanama":    [[29.400,-1.640],[29.450,-1.640],[29.450,-1.590],[29.400,-1.590],[29.400,-1.640]],
-    "Nyamyumba": [[29.275,-1.760],[29.315,-1.760],[29.315,-1.720],[29.275,-1.720],[29.275,-1.760]],
-    "Cyanzarwe": [[29.325,-1.770],[29.375,-1.770],[29.375,-1.725],[29.325,-1.725],[29.325,-1.770]],
-    "Bugeshi":   [[29.375,-1.710],[29.430,-1.710],[29.430,-1.665],[29.375,-1.665],[29.375,-1.710]],
-}
+# Real sector boundaries loaded from geoBoundaries ADM3 GeoJSON
+# Source: geoBoundaries / HDX (CC-BY 4.0) — 416 Rwanda sectors
+_SECTOR_GEOM_PATH = os.path.join(os.path.dirname(__file__), "rwanda_sectors.json")
+
+@lru_cache(maxsize=1)
+def _load_sector_geometries() -> dict:
+    try:
+        with open(_SECTOR_GEOM_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
 
 # Z-Score Thresholds (FAO / WMO Standard Framework)
 SEVERE_STRESS_ZSCORE = -1.0  # Standard deviations below historical mean
@@ -134,11 +137,13 @@ def build_roi(district: str, sector: str) -> tuple[ee.Geometry, bool]:
     ).geometry()
 
     if sector and sector != "All Sectors":
-        candidate = (
-            ee.Geometry.Polygon([SECTOR_BBOX[sector]])
-            if sector in SECTOR_BBOX
-            else district_geom.centroid(maxError=1).buffer(5_000)
-        )
+        sector_geoms = _load_sector_geometries()
+        if sector in sector_geoms:
+            # Use real geoBoundaries sector geometry, clipped to district
+            candidate = ee.Geometry(sector_geoms[sector])
+        else:
+            # Fallback: 5 km buffer around district centroid
+            candidate = district_geom.centroid(maxError=1).buffer(5_000)
         return district_geom.intersection(candidate, maxError=1), True
 
     return district_geom, False
