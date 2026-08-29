@@ -8,6 +8,7 @@ import ee
 import folium
 import pandas as pd
 import streamlit as st
+import africastalking
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 from supabase import create_client, Client
@@ -105,6 +106,63 @@ def init_earth_engine() -> bool:
     except Exception as exc:
         logger.error("Earth Engine init failed: %s", exc)
         return False
+
+def send_sms_alert(
+    supabase_client,
+    district: str,
+    sector: str,
+    stress_pct: float,
+    stress_km2: float,
+    season_label: str,
+    alert_label: str,
+) -> tuple[int, str]:
+    """
+    Fetch active contacts for the district/sector from Supabase
+    and send an SMS alert via Africa's Talking Sandbox.
+    Returns (number_sent, status_message).
+    """
+    try:
+        at_username = st.secrets.get("AT_USERNAME", "sandbox")
+        at_api_key  = st.secrets.get("AT_API_KEY", "")
+        sender_id   = st.secrets.get("AT_SENDER_ID", "AgriScan")
+
+        if not at_api_key:
+            return 0, "Africa's Talking API key not configured."
+
+        # Fetch contacts for this district
+        query = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True)
+        if sector and sector != "All Sectors":
+            # Get sector-specific contacts OR district-wide contacts
+            resp = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True).execute()
+        else:
+            resp = query.execute()
+
+        contacts = resp.data if resp.data else []
+        if not contacts:
+            return 0, f"No active contacts found for {district}."
+
+        phones = [c["phone"] for c in contacts]
+
+        # Build SMS message
+        location = sector if (sector and sector != "All Sectors") else district
+        msg = (
+            f"AGRI-SCAN ALERT [{location}] {season_label}\n"
+            f"{alert_label}: {stress_pct}% of cropland ({stress_km2} km2) under severe stress.\n"
+            f"Immediate field inspection recommended.\n"
+            f"- Agri-Scan Rwanda"
+        )
+
+        # Send via Africa's Talking
+        africastalking.initialize(at_username, at_api_key)
+        sms = africastalking.SMS
+        response = sms.send(msg, phones, sender_id=sender_id)
+
+        sent = len([r for r in response.get("SMSMessageData", {}).get("Recipients", []) if r.get("status") == "Success"])
+        return sent, f"✅ Alert sent to {sent} contact(s) in {location}."
+
+    except Exception as exc:
+        return 0, f"SMS error: {exc}"
+
 
 def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: str) -> None:
     map_id_dict = ee.Image(ee_image).getMapId(vis_params)
