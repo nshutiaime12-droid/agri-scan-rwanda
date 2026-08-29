@@ -4,4 +4,4 @@ folium>=0.17,<1.0
 streamlit-folium>=0.20,<1.0
 supabase>=2.5,<3.0
 pandas>=2.0,<3.0
-africastalking>=1.2.5
+africastalking==2.0.3
