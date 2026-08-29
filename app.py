@@ -709,27 +709,6 @@ def main() -> None:
             sms += "✅ Conditions stable. Routine monitoring advised."
         st.info(sms)
 
-    # ── SMS Alert ─────────────────────────────────────────────────────────────
-    st.sidebar.markdown("---")
-    st.sidebar.header("📨 SMS Alert")
-    if stress_pct > MODERATE_ALERT_PCT and supabase:
-        btn_label = f"📱 Send {alert_label} to Extension Officers"
-        if st.sidebar.button(btn_label, type="primary"):
-            with st.spinner("Sending SMS alert..."):
-                n_sent, sms_status = send_sms_alert(
-                    supabase, district, sector,
-                    stress_pct, stress_km2,
-                    season_label, alert_label
-                )
-            if n_sent > 0:
-                st.sidebar.success(sms_status)
-            else:
-                st.sidebar.warning(sms_status)
-    elif stress_pct <= MODERATE_ALERT_PCT:
-        st.sidebar.info("✅ No alert needed — conditions stable.")
-    else:
-        st.sidebar.warning("Supabase not configured.")
-
     # ── Exports ───────────────────────────────────────────────────────────────
     st.sidebar.markdown("---")
     st.sidebar.header("📥 Export")
