@@ -706,5 +706,68 @@ def main() -> None:
             sms += "✅ Conditions stable. Routine monitoring advised."
         st.info(sms)
 
+    # ── SMS Alert ─────────────────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.header("📨 SMS Alert")
+    if stress_pct > MODERATE_ALERT_PCT and supabase:
+        btn_label = f"📱 Send {alert_label} to Extension Officers"
+        if st.sidebar.button(btn_label, type="primary"):
+            with st.spinner("Sending SMS alert..."):
+                n_sent, sms_status = send_sms_alert(
+                    supabase, district, sector,
+                    stress_pct, stress_km2,
+                    season_label, alert_label
+                )
+            if n_sent > 0:
+                st.sidebar.success(sms_status)
+            else:
+                st.sidebar.warning(sms_status)
+    elif stress_pct <= MODERATE_ALERT_PCT:
+        st.sidebar.info("✅ No alert needed — conditions stable.")
+    else:
+        st.sidebar.warning("Supabase not configured.")
+
+    # ── Exports ───────────────────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.header("📥 Export")
+    try:
+        st.sidebar.download_button(
+            "⬇ Boundary (GeoJSON)",
+            data=json.dumps(roi.getInfo()),
+            file_name=f"boundary_{location_label.lower().replace(' ','_')}.geojson",
+            mime="application/json",
+        )
+    except Exception as exc:
+        st.sidebar.warning(f"GeoJSON unavailable: {exc}")
+
+    summary = pd.DataFrame([{
+        "District":              district,
+        "Sector":                sector,
+        "Cell":                  cell or "All",
+        "Season":                "Wet" if wet else "Dry",
+        "Start Date":            start_date,
+        "End Date":              end_date,
+        "Total Cropland km2":    total_cropland_km2,
+        "Stressed km2":          stress_km2,
+        "Stressed %":            stress_pct,
+        "Alert Level":           alert_label,
+        "Baseline NDVI":         round(baseline_mean, 3),
+        "Rainfall Anomaly %":    rain_pct,
+        "SOC g/kg":              soc_val,
+    }])
+    st.sidebar.download_button(
+        "⬇ Summary (CSV)",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name="agri_scan_summary.csv",
+        mime="text/csv",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "Agri-Scan Rwanda v4.0 · Nshuti Aimé · IUSS Pavia\n\n"
+        "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover · geoBoundaries ADM3"
+    )
+
+
 if __name__ == "__main__":
     main()
