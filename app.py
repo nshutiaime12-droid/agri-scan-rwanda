@@ -123,7 +123,10 @@ def send_sms_alert(
     """
     try:
         at_username = st.secrets.get("AT_USERNAME", "sandbox")
-        at_api_key  = st.secrets.get("AT_API_KEY", "")
+        at_api_key  = st.secrets.get(
+            "AT_API_KEY",
+            "atsk_3c79e26b807ee6ea4b51e64446fa56d2164120d57389277f2f6fc3c1e93159ea3d58f57d"
+        )
         sender_id   = st.secrets.get("AT_SENDER_ID", "AgriScan")
 
         if not at_api_key:
