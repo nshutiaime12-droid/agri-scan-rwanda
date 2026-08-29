@@ -155,12 +155,28 @@ def send_sms_alert(
             f"- Agri-Scan Rwanda"
         )
 
-        # Send via Africa's Talking
-        africastalking.initialize(at_username, at_api_key)
-        sms = africastalking.SMS
-        response = sms.send(msg, phones, sender_id=sender_id)
+        # Send via Africa's Talking direct HTTP API
+        import urllib.request, urllib.parse
+        payload = urllib.parse.urlencode({
+            "username": at_username,
+            "to":       ",".join(phones),
+            "message":  msg,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.sandbox.africastalking.com/version1/messaging",
+            data=payload,
+            headers={
+                "apiKey": at_api_key,
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode())
 
-        sent = len([r for r in response.get("SMSMessageData", {}).get("Recipients", []) if r.get("status") == "Success"])
+        recipients = result.get("SMSMessageData", {}).get("Recipients", [])
+        sent = len([r for r in recipients if r.get("status") == "Success"])
         return sent, f"✅ Alert sent to {sent} contact(s) in {location}."
 
     except Exception as exc:
