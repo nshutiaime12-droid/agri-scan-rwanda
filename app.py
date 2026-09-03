@@ -35,13 +35,46 @@ EE_PROJECT   = os.environ.get("EE_PROJECT",   "proven-record-503516-h2")
 
 DISTRICT_SECTORS: dict[str, list[str]] = {
     "Rubavu":    ["Gisenyi", "Rugerero", "Rubavu", "Kanama", "Nyamyumba", "Cyanzarwe", "Bugeshi"],
-    "Rutsiro": ["Gihango", "Kigeyo", "Kivumu", "Murunda", "Musasa", "Ruhango", "Boneza"],
-    "Nyabihu": ["Bigogwe", "Jenda", "Mukamira", "Rambura", "Rugera", "Shyira"],
-    "Musanze": ["Muhoza", "Cyuve", "Gacaca", "Gashaki", "Gataraga", "Kinigi", "Shingiro"],
-    "Kigali":    ["Nyarugenge", "Kicukiro", "Gasabo"],
     "Kayonza":   ["Mukarange", "Ruramira", "Nyamirama", "Kabare", "Gahini", "Murama", "Rukara"],
-    "Nyagatare": ["Nyagatare", "Tabagwe", "Karama", "Matimba", "Rwempasha", "Musheri", "Mimuli"],
-    "Kirehe":    ["Kirehe", "Gahara", "Nyamugari", "Mahama", "Mpanga", "Musaza", "Kigarama"]
+    "Kirehe":    ["Kirehe", "Gahara", "Nyamugari", "Mahama", "Mpanga", "Musaza", "Kigarama"],
+    "Nyagatare": ["Nyagatare", "Tabagwe", "Karama", "Matimba", "Rwempasha", "Musheri", "Mimuri"],
+}
+
+# Cells per sector — pre-filtered so dropdown only shows cells
+# belonging to the selected sector (prevents wrong-district crashes)
+SECTOR_CELLS: dict[str, list[str]] = {
+    # Rubavu sectors
+    "Gisenyi":   ["Bugoyi","Gasiza","Kagunga","Kivumu","Muganza","Murara","Poids"],
+    "Rugerero":  ["Cyanzarwe","Gasura","Kayove","Kirambo","Muramba","Nyundo","Rambura"],
+    "Rubavu":    ["Bugeshi","Butangampunzi","Giseke","Gisenyi","Karago","Murara","Nyundo"],
+    "Kanama":    ["Bigogwe","Bungwe","Gasura","Kanama","Muramba","Nkamira","Nyundo"],
+    "Nyamyumba": ["Bigogwe","Cyanzarwe","Gihuke","Kagano","Kabaya","Nyamyumba","Ruhanga"],
+    "Cyanzarwe": ["Byahi","Cyanzarwe","Gihuke","Kanama","Kirehe","Muramba","Nyagasozi"],
+    "Bugeshi":   ["Bugeshi","Bwira","Giseke","Kanama","Kidaho","Muramba","Rwaza"],
+    # Kayonza sectors
+    "Mukarange": ["Cyinzuzi","Gacurabwenge","Kagitumba","Karenge","Kibungo","Mugambazi","Mukarange"],
+    "Ruramira":  ["Birambo","Gahini","Kagarama","Kigarama","Nyakagezi","Ruramira","Rwinkwavu"],
+    "Nyamirama": ["Gahini","Kabare","Kibungo","Murama","Nyamirama","Rusumo","Rwinkwavu"],
+    "Kabare":    ["Gahini","Kabare","Kagitumba","Kibungo","Murama","Nyamirama","Rwinkwavu"],
+    "Gahini":    ["Gahini","Kabare","Kibungo","Mugambazi","Murama","Nyamirama","Rwinkwavu"],
+    "Murama":    ["Gahini","Kabare","Kibungo","Murama","Nyamirama","Ruramira","Rwinkwavu"],
+    "Rukara":    ["Gahini","Kabare","Kibungo","Murama","Nyamirama","Rukara","Rwinkwavu"],
+    # Kirehe sectors
+    "Kirehe":    ["Gahara","Kabare","Kigarama","Kirehe","Mpanga","Musaza","Nyamugari"],
+    "Gahara":    ["Gahara","Kabare","Kigarama","Kirehe","Mpanga","Musaza","Nyamugari"],
+    "Nyamugari": ["Gahara","Kabare","Kigarama","Kirehe","Mpanga","Musaza","Nyamugari"],
+    "Mahama":    ["Gahara","Kabare","Kigarama","Kirehe","Mahama","Mpanga","Musaza"],
+    "Mpanga":    ["Gahara","Kabare","Kigarama","Kirehe","Mpanga","Musaza","Nyamugari"],
+    "Musaza":    ["Gahara","Kabare","Kigarama","Kirehe","Mpanga","Musaza","Nyamugari"],
+    "Kigarama":  ["Gahara","Kabare","Kigarama","Kirehe","Mpanga","Musaza","Nyamugari"],
+    # Nyagatare sectors
+    "Nyagatare": ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
+    "Tabagwe":   ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
+    "Karama":    ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
+    "Matimba":   ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
+    "Rwempasha":  ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
+    "Musheri":   ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
+    "Mimuri":    ["Karama","Matimba","Mimuri","Musheri","Nyagatare","Rwempasha","Tabagwe"],
 }
 
 _SECTOR_GEOM_PATH = os.path.join(os.path.dirname(__file__), "rwanda_sectors.json")
@@ -186,19 +219,35 @@ def build_roi(district: str, sector: str, cell: str | None = None) -> tuple[ee.G
         )
     ).geometry()
 
+    # Cell level — only attempt if cell belongs to selected sector
     if cell and cell != "All Cells":
         cell_geoms = _load_cell_geometries()
         if cell in cell_geoms:
-            candidate = ee.Geometry(cell_geoms[cell])
-            return district_geom.intersection(candidate, maxError=1), True
+            try:
+                candidate = ee.Geometry(cell_geoms[cell])
+                roi = district_geom.intersection(candidate, maxError=10)
+                # Validate — if area is suspiciously large fall back to sector
+                area = roi.area(maxError=100).getInfo()
+                if area > 0:
+                    return roi, True
+            except Exception as exc:
+                logger.warning("Cell ROI failed (%s), falling back to sector: %s", cell, exc)
 
+    # Sector level
     if sector and sector != "All Sectors":
         sector_geoms = _load_sector_geometries()
         if sector in sector_geoms:
-            candidate = ee.Geometry(sector_geoms[sector])
-        else:
-            candidate = district_geom.centroid(maxError=1).buffer(5_000)
-        return district_geom.intersection(candidate, maxError=1), True
+            try:
+                candidate = ee.Geometry(sector_geoms[sector])
+                roi = district_geom.intersection(candidate, maxError=10)
+                area = roi.area(maxError=100).getInfo()
+                if area > 0:
+                    return roi, True
+            except Exception as exc:
+                logger.warning("Sector ROI failed (%s), falling back to district: %s", sector, exc)
+        # Fallback: 5 km buffer around district centroid
+        candidate = district_geom.centroid(maxError=1).buffer(5_000)
+        return district_geom.intersection(candidate, maxError=10), True
 
     return district_geom, False
 
@@ -471,8 +520,12 @@ def main() -> None:
     district = st.sidebar.selectbox("District", list(DISTRICT_SECTORS.keys()))
     sector   = st.sidebar.selectbox("Sector (Umurenge)", ["All Sectors"] + DISTRICT_SECTORS[district])
     
-    cell_geoms = _load_cell_geometries()
-    cell_options = ["All Cells"] + sorted(list(cell_geoms.keys()))
+    # Show only cells belonging to selected sector (prevents wrong-district crashes)
+    if sector and sector != "All Sectors" and sector in SECTOR_CELLS:
+        available_cells = SECTOR_CELLS[sector]
+    else:
+        available_cells = []
+    cell_options = ["All Cells"] + sorted(available_cells)
     selected_cell = st.sidebar.selectbox("Cell (Akagari)", cell_options)
     cell = None if selected_cell == "All Cells" else selected_cell
 
