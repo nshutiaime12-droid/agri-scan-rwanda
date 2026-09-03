@@ -40,6 +40,8 @@ DISTRICT_SECTORS: dict[str, list[str]] = {
     "Nyagatare": ["Nyagatare", "Tabagwe", "Karama", "Matimba", "Rwempasha", "Musheri", "Mimuri"],
 }
 
+# Cells per sector — pre-filtered so dropdown only shows cells
+# belonging to the selected sector (prevents wrong-district crashes)
 SECTOR_CELLS: dict[str, list[str]] = {
     "Gisenyi": ["Amahoro", "Bugoyi", "Kivumu", "Mbugangari", "Nengo", "Rubavu", "Umuganda"],
     "Rugerero": ["Basa", "Gisa", "Kabilizi", "Muhira", "Rugerero", "Rushubi", "Rwaza"],
@@ -134,6 +136,66 @@ def init_earth_engine() -> bool:
         logger.error("Earth Engine init failed: %s", exc)
         return False
 
+def send_sms_alert(
+    supabase_client,
+    district: str,
+    sector: str,
+    stress_pct: float,
+    stress_km2: float,
+    season_label: str,
+    alert_label: str,
+) -> tuple[int, str]:
+    """
+    Fetch active contacts for the district/sector from Supabase
+    and send an SMS alert via Africa's Talking Sandbox.
+    Returns (number_sent, status_message).
+    """
+    try:
+        at_username = st.secrets.get("AT_USERNAME", "sandbox")
+        at_api_key  = st.secrets.get(
+            "AT_API_KEY",
+            "atsk_a851e00bec541799c7b1bd372a2c58cfea6317409b096bf6d3651d2655da7c267d6d9ca3"
+        )
+        sender_id   = st.secrets.get("AT_SENDER_ID", "AgriScan")
+
+        if not at_api_key:
+            return 0, "Africa's Talking API key not configured."
+
+        # Fetch contacts for this district
+        query = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True)
+        if sector and sector != "All Sectors":
+            # Get sector-specific contacts OR district-wide contacts
+            resp = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True).execute()
+        else:
+            resp = query.execute()
+
+        contacts = resp.data if resp.data else []
+        if not contacts:
+            return 0, f"No active contacts found for {district}."
+
+        phones = [c["phone"] for c in contacts]
+
+        # Build SMS message
+        location = sector if (sector and sector != "All Sectors") else district
+        msg = (
+            f"AGRI-SCAN ALERT [{location}] {season_label}\n"
+            f"{alert_label}: {stress_pct}% of cropland ({stress_km2} km2) under severe stress.\n"
+            f"Immediate field inspection recommended.\n"
+            f"- Agri-Scan Rwanda"
+        )
+
+        # Send via Africa's Talking Python SDK
+        import africastalking as _at
+        _at.initialize(at_username, at_api_key)
+        response = _at.SMS.send(msg, phones)
+        recipients = response.get("SMSMessageData", {}).get("Recipients", [])
+        sent = len([r for r in recipients if r.get("status") == "Success"])
+        return sent, f"✅ Alert sent to {sent} contact(s) in {location}."
+
+    except Exception as exc:
+        return 0, f"SMS error: {exc}"
+
+
 def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: str) -> None:
     map_id_dict = ee.Image(ee_image).getMapId(vis_params)
     folium.TileLayer(
@@ -153,18 +215,21 @@ def build_roi(district: str, sector: str, cell: str | None = None) -> tuple[ee.G
         )
     ).geometry()
 
+    # Cell level — only attempt if cell belongs to selected sector
     if cell and cell != "All Cells":
         cell_geoms = _load_cell_geometries()
         if cell in cell_geoms:
             try:
                 candidate = ee.Geometry(cell_geoms[cell])
                 roi = district_geom.intersection(candidate, maxError=10)
+                # Validate — if area is suspiciously large fall back to sector
                 area = roi.area(maxError=100).getInfo()
                 if area > 0:
                     return roi, True
             except Exception as exc:
                 logger.warning("Cell ROI failed (%s), falling back to sector: %s", cell, exc)
 
+    # Sector level
     if sector and sector != "All Sectors":
         sector_geoms = _load_sector_geometries()
         if sector in sector_geoms:
@@ -176,6 +241,7 @@ def build_roi(district: str, sector: str, cell: str | None = None) -> tuple[ee.G
                     return roi, True
             except Exception as exc:
                 logger.warning("Sector ROI failed (%s), falling back to district: %s", sector, exc)
+        # Fallback: 5 km buffer around district centroid
         candidate = district_geom.centroid(maxError=1).buffer(5_000)
         return district_geom.intersection(candidate, maxError=10), True
 
@@ -211,7 +277,7 @@ def compute_ndvi_anomaly(
     if s2.size().getInfo() == 0:
         return None, 0.0, 0.0
 
-    water_mask    = s2.median().normalizedDifference(["B3", "B8"]).lte(0.0)
+    water_mask    = s2.first().normalizedDifference(["B3", "B8"]).lte(0.0)
     crop_mask     = _get_cropland_mask(roi)
     combined_mask = water_mask.And(crop_mask)
 
@@ -237,31 +303,25 @@ def compute_ndvi_anomaly(
     mean_img = masked_baseline.mean()
     std_img  = masked_baseline.reduce(ee.Reducer.stdDev()).rename("NDVI")
 
-    try:
-        baseline_stats = mean_img.reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
-        )
-        baseline_mean = float(
-            ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
-        )
-    except Exception:
-        baseline_mean = 0.0
+    baseline_stats = mean_img.reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
+    )
+    baseline_mean = float(
+        ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
+    )
 
     current = s2_ndvi.select("NDVI").filterDate(str(start), str(end)).median().updateMask(combined_mask)
     z_score = current.subtract(mean_img).divide(std_img.max(0.01)).rename('z_score').clip(roi)
 
     stress_mask = z_score.lt(SEVERE_STRESS_ZSCORE)
-    try:
-        area_dict = (
-            ee.Image.pixelArea().divide(1e6)
-            .updateMask(stress_mask)
-            .reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=20, maxPixels=1e9)
-        )
-        stress_km2 = round(
-            float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
-        )
-    except Exception:
-        stress_km2 = 0.0
+    area_dict   = (
+        ee.Image.pixelArea().divide(1e6)
+        .updateMask(stress_mask)
+        .reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=20, maxPixels=1e9)
+    )
+    stress_km2 = round(
+        float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
+    )
 
     return z_score, stress_km2, baseline_mean
 
@@ -282,6 +342,10 @@ def get_soc_layer(roi: ee.Geometry) -> ee.Image:
     )
 
 def compute_rain_stats(roi: ee.Geometry, start: date, end: date) -> tuple[float, str]:
+    """
+    Mean rainfall anomaly % over the ROI.
+    Returns (anomaly_pct, status_label).
+    """
     try:
         chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(roi)
         current_sum    = chirps.filterDate(str(start), str(end)).select("precipitation").sum()
@@ -304,7 +368,12 @@ def compute_rain_stats(roi: ee.Geometry, start: date, end: date) -> tuple[float,
     except Exception:
         return 0.0, "—"
 
+
 def compute_soc_stats(roi: ee.Geometry) -> tuple[float, str]:
+    """
+    Mean soil organic carbon (g/kg) over cropland in the ROI.
+    FAO thresholds: <20 = Low, 20-40 = Medium, >40 = High
+    """
     try:
         crop_mask = _get_cropland_mask(roi)
         soc = (
@@ -328,6 +397,7 @@ def compute_soc_stats(roi: ee.Geometry) -> tuple[float, str]:
         return soc_val, label
     except Exception:
         return 0.0, "—"
+
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_total_cropland_km2(district: str, sector: str = "All Sectors", cell: str | None = None) -> float:
@@ -392,16 +462,13 @@ def get_ndvi_timeseries(
         )
     )
 
-    try:
-        baseline_stats = (
-            baseline_ic.select("NDVI").median().updateMask(crop_mask)
-            .reduceRegion(reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8)
-        )
-        baseline_mean = float(
-            ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
-        )
-    except Exception:
-        baseline_mean = 0.0
+    baseline_stats = (
+        baseline_ic.select("NDVI").median().updateMask(crop_mask)
+        .reduceRegion(reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8)
+    )
+    baseline_mean = float(
+        ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
+    )
 
     df["Seasonal Baseline"] = baseline_mean
     return df, baseline_mean
@@ -444,10 +511,12 @@ def main() -> None:
 
     supabase = get_supabase()
 
+    # Sidebar Inputs
     st.sidebar.header("📍 Location & Search")
     district = st.sidebar.selectbox("District", list(DISTRICT_SECTORS.keys()))
     sector   = st.sidebar.selectbox("Sector (Umurenge)", ["All Sectors"] + DISTRICT_SECTORS[district])
     
+    # Show only cells belonging to selected sector (prevents wrong-district crashes)
     if sector and sector != "All Sectors" and sector in SECTOR_CELLS:
         available_cells = SECTOR_CELLS[sector]
     else:
@@ -493,6 +562,7 @@ def main() -> None:
         rain_pct, rain_label = compute_rain_stats(roi, start_date, end_date) if show_rain else (0.0, "—")
         soc_val, soc_label   = compute_soc_stats(roi) if show_soc else (0.0, "—")
 
+    # UPI / Parcel Lookup
     map_center = [-1.9403, 29.8739]
     zoom_level = 11
     parcel_data = None
@@ -519,6 +589,7 @@ def main() -> None:
         except Exception:
             pass
 
+    # KPI Row
     if stress_pct > HIGH_ALERT_PCT:
         alert_label, alert_color = "🔴 High Alert", "inverse"
     elif stress_pct > MODERATE_ALERT_PCT:
@@ -543,6 +614,7 @@ def main() -> None:
 
     st.markdown("---")
 
+    # Map Creation
     fmap = folium.Map(location=map_center, zoom_start=zoom_level, tiles="OpenStreetMap")
     folium.TileLayer(
         tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
@@ -592,6 +664,7 @@ def main() -> None:
 
     map_data = st_folium(fmap, use_container_width=True, height=540, key="farm_map")
 
+    # Location Details Section
     st.markdown("### 📍 Farm Location Details")
     lc1, lc2, lc3, lc4 = st.columns(4)
     lc1.metric("Sector (Umurenge)", location_label)
@@ -599,6 +672,7 @@ def main() -> None:
     lc3.metric("Village (Umudugudu)", village or "Not specified")
     lc4.metric("UPI Parcel ID", upi or "Draw on map")
 
+    # Plot analytics based on drawn geometry
     plot_z_val: float | None = None
     if map_data and map_data.get("last_active_drawing"):
         drawing = map_data["last_active_drawing"]
@@ -628,6 +702,7 @@ def main() -> None:
 
     st.markdown("---")
 
+    # Time-Series + Agronomic Advisory
     chart_col, advisory_col = st.columns([2, 1])
 
     with chart_col:
@@ -656,6 +731,7 @@ def main() -> None:
             st.success(f"**🟢 Stable:** {stress_pct}% cropland stressed — within normal variation.")
             st.markdown("- **Routine monitoring:** Continue bi-weekly tracking.")
 
+    # Farmer Summary & Export Options
     st.markdown("---")
     st.subheader("🌾 Farmer-Friendly Summary (Amakuru y'Ubuhinzi)")
     fc1, fc2 = st.columns(2)
@@ -682,6 +758,7 @@ def main() -> None:
             sms += "✅ Conditions stable. Routine monitoring advised."
         st.info(sms)
 
+    # ── Exports ───────────────────────────────────────────────────────────────
     st.sidebar.markdown("---")
     st.sidebar.header("📥 Export")
     try:
@@ -721,6 +798,7 @@ def main() -> None:
         "Agri-Scan Rwanda v4.0 · Nshuti Aimé · IUSS Pavia\n\n"
         "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover · geoBoundaries ADM3"
     )
+
 
 if __name__ == "__main__":
     main()
