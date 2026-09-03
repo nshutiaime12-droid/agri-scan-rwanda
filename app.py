@@ -145,23 +145,16 @@ def send_sms_alert(
     season_label: str,
     alert_label: str,
 ) -> tuple[int, str]:
-    """
-    Fetch active contacts for the district/sector from Supabase
-    and send an SMS alert via Africa's Talking Sandbox.
-    Returns (number_sent, status_message).
-    """
     try:
         at_username = st.secrets.get("AT_USERNAME", "sandbox")
         at_api_key  = st.secrets.get(
             "AT_API_KEY",
             "atsk_a851e00bec541799c7b1bd372a2c58cfea6317409b096bf6d3651d2655da7c267d6d9ca3"
         )
-        sender_id   = st.secrets.get("AT_SENDER_ID", "AgriScan")
 
         if not at_api_key:
             return 0, "Africa's Talking API key not configured."
 
-        # Fetch contacts for this district
         query = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True)
         if sector and sector != "All Sectors":
             resp = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True).execute()
@@ -270,7 +263,6 @@ def compute_ndvi_anomaly(
     if s2.size().getInfo() == 0:
         return None, 0.0, 0.0
 
-    # FIX: Use median across the collection instead of .first() to prevent narrow striping across tiles
     water_mask    = s2.median().normalizedDifference(["B3", "B8"]).lte(0.0)
     crop_mask     = _get_cropland_mask(roi)
     combined_mask = water_mask.And(crop_mask)
@@ -297,12 +289,15 @@ def compute_ndvi_anomaly(
     mean_img = masked_baseline.mean()
     std_img  = masked_baseline.reduce(ee.Reducer.stdDev()).rename("NDVI")
 
-    baseline_stats = mean_img.reduceRegion(
-        reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
-    )
-    baseline_mean = float(
-        ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
-    )
+    try:
+        baseline_stats = mean_img.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
+        )
+        baseline_mean = float(
+            ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
+        )
+    except Exception:
+        baseline_mean = 0.0
 
     current = s2_ndvi.select("NDVI").filterDate(str(start), str(end)).median().updateMask(combined_mask)
     z_score = current.subtract(mean_img).divide(std_img.max(0.01)).rename('z_score').clip(roi)
@@ -448,13 +443,16 @@ def get_ndvi_timeseries(
         )
     )
 
-    baseline_stats = (
-        baseline_ic.select("NDVI").median().updateMask(crop_mask)
-        .reduceRegion(reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8)
-    )
-    baseline_mean = float(
-        ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
-    )
+    try:
+        baseline_stats = (
+            baseline_ic.select("NDVI").median().updateMask(crop_mask)
+            .reduceRegion(reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8)
+        )
+        baseline_mean = float(
+            ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
+        )
+    except Exception:
+        baseline_mean = 0.0
 
     df["Seasonal Baseline"] = baseline_mean
     return df, baseline_mean
@@ -497,7 +495,6 @@ def main() -> None:
 
     supabase = get_supabase()
 
-    # Sidebar Inputs
     st.sidebar.header("📍 Location & Search")
     district = st.sidebar.selectbox("District", list(DISTRICT_SECTORS.keys()))
     sector   = st.sidebar.selectbox("Sector (Umurenge)", ["All Sectors"] + DISTRICT_SECTORS[district])
