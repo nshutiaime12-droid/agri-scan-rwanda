@@ -40,8 +40,6 @@ DISTRICT_SECTORS: dict[str, list[str]] = {
     "Nyagatare": ["Nyagatare", "Tabagwe", "Karama", "Matimba", "Rwempasha", "Musheri", "Mimuri"],
 }
 
-# Cells per sector — pre-filtered so dropdown only shows cells
-# belonging to the selected sector (prevents wrong-district crashes)
 SECTOR_CELLS: dict[str, list[str]] = {
     "Gisenyi": ["Amahoro", "Bugoyi", "Kivumu", "Mbugangari", "Nengo", "Rubavu", "Umuganda"],
     "Rugerero": ["Basa", "Gisa", "Kabilizi", "Muhira", "Rugerero", "Rushubi", "Rwaza"],
@@ -135,56 +133,6 @@ def init_earth_engine() -> bool:
     except Exception as exc:
         logger.error("Earth Engine init failed: %s", exc)
         return False
-
-def send_sms_alert(
-    supabase_client,
-    district: str,
-    sector: str,
-    stress_pct: float,
-    stress_km2: float,
-    season_label: str,
-    alert_label: str,
-) -> tuple[int, str]:
-    try:
-        at_username = st.secrets.get("AT_USERNAME", "sandbox")
-        at_api_key  = st.secrets.get(
-            "AT_API_KEY",
-            "atsk_a851e00bec541799c7b1bd372a2c58cfea6317409b096bf6d3651d2655da7c267d6d9ca3"
-        )
-
-        if not at_api_key:
-            return 0, "Africa's Talking API key not configured."
-
-        query = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True)
-        if sector and sector != "All Sectors":
-            resp = supabase_client.table("contacts").select("*").eq("district", district).eq("active", True).execute()
-        else:
-            resp = query.execute()
-
-        contacts = resp.data if resp.data else []
-        if not contacts:
-            return 0, f"No active contacts found for {district}."
-
-        phones = [c["phone"] for c in contacts]
-
-        location = sector if (sector and sector != "All Sectors") else district
-        msg = (
-            f"AGRI-SCAN ALERT [{location}] {season_label}\n"
-            f"{alert_label}: {stress_pct}% of cropland ({stress_km2} km2) under severe stress.\n"
-            f"Immediate field inspection recommended.\n"
-            f"- Agri-Scan Rwanda"
-        )
-
-        import africastalking as _at
-        _at.initialize(at_username, at_api_key)
-        response = _at.SMS.send(msg, phones)
-        recipients = response.get("SMSMessageData", {}).get("Recipients", [])
-        sent = len([r for r in recipients if r.get("status") == "Success"])
-        return sent, f"✅ Alert sent to {sent} contact(s) in {location}."
-
-    except Exception as exc:
-        return 0, f"SMS error: {exc}"
-
 
 def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: str) -> None:
     map_id_dict = ee.Image(ee_image).getMapId(vis_params)
@@ -303,14 +251,17 @@ def compute_ndvi_anomaly(
     z_score = current.subtract(mean_img).divide(std_img.max(0.01)).rename('z_score').clip(roi)
 
     stress_mask = z_score.lt(SEVERE_STRESS_ZSCORE)
-    area_dict   = (
-        ee.Image.pixelArea().divide(1e6)
-        .updateMask(stress_mask)
-        .reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=20, maxPixels=1e9)
-    )
-    stress_km2 = round(
-        float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
-    )
+    try:
+        area_dict = (
+            ee.Image.pixelArea().divide(1e6)
+            .updateMask(stress_mask)
+            .reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=20, maxPixels=1e9)
+        )
+        stress_km2 = round(
+            float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
+        )
+    except Exception:
+        stress_km2 = 0.0
 
     return z_score, stress_km2, baseline_mean
 
@@ -353,7 +304,6 @@ def compute_rain_stats(roi: ee.Geometry, start: date, end: date) -> tuple[float,
     except Exception:
         return 0.0, "—"
 
-
 def compute_soc_stats(roi: ee.Geometry) -> tuple[float, str]:
     try:
         crop_mask = _get_cropland_mask(roi)
@@ -378,7 +328,6 @@ def compute_soc_stats(roi: ee.Geometry) -> tuple[float, str]:
         return soc_val, label
     except Exception:
         return 0.0, "—"
-
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_total_cropland_km2(district: str, sector: str = "All Sectors", cell: str | None = None) -> float:
@@ -772,7 +721,6 @@ def main() -> None:
         "Agri-Scan Rwanda v4.0 · Nshuti Aimé · IUSS Pavia\n\n"
         "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover · geoBoundaries ADM3"
     )
-
 
 if __name__ == "__main__":
     main()
