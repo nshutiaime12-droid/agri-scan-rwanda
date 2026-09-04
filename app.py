@@ -534,7 +534,16 @@ def main() -> None:
     st.sidebar.markdown("---")
     st.sidebar.header("📅 Date Range")
     default_end   = date.today() - timedelta(days=1)
-    default_start = default_end.replace(month=1, day=1)
+    # Default to most recent completed wet season (Oct–May)
+    # so Eastern Province districts show meaningful crop stress data
+    if default_end.month >= 10:
+        default_start = default_end.replace(month=10, day=1)
+    elif default_end.month <= 5:
+        default_start = date(default_end.year - 1, 10, 1)
+    else:
+        # Jun-Sep dry season: show previous wet season
+        default_start = date(default_end.year - 1, 10, 1)
+        default_end   = date(default_end.year, 5, 31)
     start_date = st.sidebar.date_input("Start", default_start)
     end_date   = st.sidebar.date_input("End",   default_end)
 
