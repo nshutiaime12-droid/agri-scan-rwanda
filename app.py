@@ -903,3 +903,78 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# ── EXTENSIONS & ANALYTICAL MODULES ──────────────────────────────────────────
+import datetime
+
+def log_alert_to_supabase(supabase, district, sector, cell, season, stress_km2, stress_pct, baseline_ndvi, ndmi_mean, n_images, alert_label):
+    """Logs stress alerts to Supabase audit log."""
+    if not supabase or stress_pct < 5.0:
+        return
+    try:
+        payload = {
+            "district": district,
+            "sector": sector,
+            "cell": cell or "All Cells",
+            "season": season,
+            "stress_km2": round(stress_km2, 2),
+            "stress_pct": round(stress_pct, 1),
+            "baseline_ndvi": round(baseline_ndvi, 3),
+            "ndmi_anomaly": round(ndmi_mean, 3),
+            "satellite_coverage": n_images,
+            "alert_level": alert_label,
+        }
+        supabase.table("alert_logs").insert(payload).execute()
+    except Exception:
+        pass
+
+def render_yield_impact_estimator(stress_km2: float, stress_pct: float):
+    """Calculates estimated crop monetary and yield losses."""
+    st.markdown("---")
+    st.markdown("### 💰 Crop Loss & Yield Impact Estimator")
+    if stress_km2 <= 0:
+        st.info("No active cropland stress detected.")
+        return
+
+    crop_defaults = {
+        "Maize 🌽": {"yield_ha": 2.5, "price_per_kg": 350},
+        "Beans 🫘": {"yield_ha": 1.2, "price_per_kg": 600},
+        "Irish Potato 🥔": {"yield_ha": 12.0, "price_per_kg": 250},
+    }
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        selected_crop = st.selectbox("Primary Crop Filter", list(crop_defaults.keys()))
+        loss_severity = st.slider("Estimated Yield Loss Severity (%)", 10, 80, 30, step=5)
+
+    params = crop_defaults[selected_crop]
+    stressed_hectares = stress_km2 * 100
+    potential_yield_tons = stressed_hectares * params["yield_ha"]
+    lost_tons = potential_yield_tons * (loss_severity / 100.0)
+    lost_rwf = lost_tons * 1000 * params["price_per_kg"]
+
+    with c2:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Stressed Area", f"{stressed_hectares:,.0f} Ha")
+        m2.metric("Est. Yield Loss", f"{lost_tons:,.1f} MT", delta=f"-{loss_severity}%", delta_color="inverse")
+        m3.metric("Est. Economic Risk", f"{lost_rwf/1e6:,.1f}M RWF", delta="Potential Loss", delta_color="inverse")
+
+def generate_html_report(district, sector, cell, season, stress_km2, stress_pct, total_cropland_km2, alert_label):
+    """Generates printable HTML situation report."""
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    location = f"{district} - {sector}" + (f" ({cell})" if cell else "")
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Field Situation Report - {location}</title></head>
+    <body style="font-family: Arial, sans-serif; margin: 30px; color: #222;">
+        <h1 style="color: #1b5e20;">🌾 Agri-Scan Rwanda: Field Situation Report</h1>
+        <p><strong>Location:</strong> {location}</p>
+        <p><strong>Season:</strong> {season} | <strong>Generated:</strong> {now_str}</p>
+        <hr/>
+        <h3>Alert Overview</h3>
+        <p><strong>Status:</strong> {alert_label} RISK</p>
+        <p><strong>Stressed Area:</strong> {stress_km2:.2f} km² ({stress_pct:.1f}%)</p>
+        <p><strong>Total Cropland Analyzed:</strong> {total_cropland_km2:.1f} km²</p>
+    </body>
+    </html>
+    """
