@@ -903,7 +903,7 @@ def main() -> None:
 
 
 # ── EXTENSIONS & ANALYTICAL MODULES ──
- ──────────────────────────────────────────
+
 import datetime
 
 def log_alert_to_supabase(supabase, district, sector, cell, season, stress_km2, stress_pct, baseline_ndvi, ndmi_mean, n_images, alert_label):
