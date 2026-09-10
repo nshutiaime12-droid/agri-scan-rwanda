@@ -901,9 +901,9 @@ def main() -> None:
         "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover · geoBoundaries ADM3"
     )
 
-if __name__ == "__main__":
-    main()
-# ── EXTENSIONS & ANALYTICAL MODULES ──────────────────────────────────────────
+
+# ── EXTENSIONS & ANALYTICAL MODULES ──
+ ──────────────────────────────────────────
 import datetime
 
 def log_alert_to_supabase(supabase, district, sector, cell, season, stress_km2, stress_pct, baseline_ndvi, ndmi_mean, n_images, alert_label):
@@ -978,3 +978,7 @@ def generate_html_report(district, sector, cell, season, stress_km2, stress_pct,
     </body>
     </html>
     """
+
+if __name__ == "__main__":
+
+    main()
