@@ -42,26 +42,30 @@ supabase_client = init_supabase()
 
 # Initialize Google Earth Engine
 @st.cache_resource
-def init_earth_engine() -> bool:
-    try:
-        ee.Initialize()
-        return True
-    except Exception:
-        try:
-            ee_service_account = get_secret("client_email", group="earth_engine")
-            ee_private_key = get_secret("private_key", group="earth_engine")
-            if ee_service_account and ee_private_key:
-                credentials = ee.ServiceAccountCredentials(ee_service_account, key_data=ee_private_key)
-                ee.Initialize(credentials)
-                return True
-            else:
-                ee.Initialize()
-                return True
-        except Exception as exc:
-            logger.error(f"Earth Engine initialization failed: {exc}")
-            return False
 
-ee_available = init_earth_engine()
+# Initialize Google Earth Engine eagerly
+def init_earth_engine_eager():
+    try:
+        ee_service_account = get_secret("client_email", group="earth_engine")
+        ee_private_key = get_secret("private_key", group="earth_engine")
+        ee_project = get_secret("project_id", group="earth_engine")
+        
+        if ee_service_account and ee_private_key:
+            credentials = ee.ServiceAccountCredentials(ee_service_account, key_data=ee_private_key)
+            if ee_project:
+                ee.Initialize(credentials, project=ee_project)
+            else:
+                ee.Initialize(credentials)
+            return True
+        else:
+            ee.Initialize()
+            return True
+    except Exception as exc:
+        logger.warning(f"Earth Engine initialization failed: {exc}")
+        return False
+
+ee_available = init_earth_engine_eager()
+
 
 # ==============================================================================
 # 2. PILOT GEOGRAPHIC HIERARCHY & ROI BUILDER
@@ -95,8 +99,6 @@ def build_roi(district: str, sector: str, cell: str) -> Tuple[Any, str, str]:
     Constructs an Earth Engine geometry with a strict hierarchy (District -> Sector -> Cell).
     Returns (roi_geometry, analysis_level, label_text).
     """
-    # Boundary definitions (using mock bounding boxes for demo stability; replace with Earth Engine FeatureCollection assets)
-    # Coordinates format: [[min_lon, min_lat], [max_lon, min_lat], [max_lon, max_lat], [min_lon, max_lat]]
     bounds = {
         "Rubavu": [29.23, -1.72, 29.35, -1.62],
         "Kayonza": [30.45, -2.00, 30.80, -1.70],
@@ -109,24 +111,17 @@ def build_roi(district: str, sector: str, cell: str) -> Tuple[Any, str, str]:
     if cell and cell != "All Cells":
         analysis_level = "cell"
         label_text = f"{district} ➔ {sector} ➔ Cell: {cell}"
-        # Small sub-box offset to emulate cell geometry
-        roi = ee.Geometry.Rectangle([
-            base_box[0] + 0.01, base_box[1] + 0.01, 
-            base_box[0] + 0.03, base_box[1] + 0.03
-        ])
+        coords = [base_box[0] + 0.01, base_box[1] + 0.01, base_box[0] + 0.03, base_box[1] + 0.03]
     elif sector and sector != "All Sectors":
         analysis_level = "sector"
         label_text = f"{district} ➔ Sector: {sector}"
-        # Medium sub-box offset to emulate sector geometry
-        roi = ee.Geometry.Rectangle([
-            base_box[0], base_box[1], 
-            base_box[0] + 0.06, base_box[1] + 0.06
-        ])
+        coords = [base_box[0], base_box[1], base_box[0] + 0.06, base_box[1] + 0.06]
     else:
         analysis_level = "district"
         label_text = f"District: {district}"
-        roi = ee.Geometry.Rectangle(base_box)
+        coords = base_box
         
+    roi = ee.Geometry.Rectangle(coords) if ee_available else coords
     return roi, analysis_level, label_text
 
 # ==============================================================================
