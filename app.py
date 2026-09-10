@@ -1,5 +1,3 @@
-# 1. Overwrite Cloud Shell app.py with the 950+ line consolidated script
-cat << 'EOF' > ~/app.py
 import os
 import io
 import datetime
@@ -493,13 +491,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
-
-# 2. Sync to production repository folder
-cp ~/app.py ~/agri-scan-rwanda/app.py
-
-# 3. Commit and push live
-cd ~/agri-scan-rwanda
-git add app.py
-git commit -m "Deploy v4.1 full 950+ line consolidated script with strict ROI hierarchy"
-git push origin main
