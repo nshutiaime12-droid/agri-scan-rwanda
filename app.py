@@ -1,318 +1,935 @@
 import os
-import io
-import datetime
+import json
 import logging
-from typing import Tuple, Dict, Any, Optional
+from functools import lru_cache
+from datetime import date, timedelta
 
-import streamlit as st
-import pandas as pd
-import numpy as np
 import ee
 import folium
+import pandas as pd
+import streamlit as st
+from folium.plugins import Draw
 from streamlit_folium import st_folium
-import plotly.express as px
-import plotly.graph_objects as go
 from supabase import create_client, Client
-import africastalking
 
-logger = logging.getLogger("agri_scan")
-logging.basicConfig(level=logging.INFO)
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Agri-Scan Rwanda",
+    page_icon="🌾",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ==============================================================================
-# 1. SECRETS & HARDENED AUTHENTICATION
-# ==============================================================================
-def get_secret(key_name: str, group: Optional[str] = None, default: str = "") -> str:
-    try:
-        if group and group in st.secrets:
-            return st.secrets[group].get(key_name, default)
-        return st.secrets.get(key_name, default)
-    except Exception as err:
-        logger.warning(f"Could not load secret '{key_name}': {err}")
-        return default
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
-@st.cache_resource
-def init_supabase() -> Optional[Client]:
-    url = get_secret("url", group="supabase")
-    key = get_secret("key", group="supabase")
-    if url and key:
-        try:
-            return create_client(url, key)
-        except Exception as exc:
-            logger.error(f"Failed to initialize Supabase client: {exc}")
-    return None
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS & PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://neskcsbhdzrtdkintqgg.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_XUoeoM27WFCugu3pRLx4Wg_WTled...")
+EE_PROJECT   = os.environ.get("EE_PROJECT",   "proven-record-503516-h2")
 
-supabase_client = init_supabase()
-
-def init_earth_engine_eager() -> bool:
-    try:
-        ee_service_account = get_secret("client_email", group="earth_engine")
-        ee_private_key = get_secret("private_key", group="earth_engine")
-        ee_project = get_secret("project_id", group="earth_engine")
-        
-        if ee_service_account and ee_private_key:
-            credentials = ee.ServiceAccountCredentials(ee_service_account, key_data=ee_private_key)
-            if ee_project:
-                ee.Initialize(credentials, project=ee_project)
-            else:
-                ee.Initialize(credentials)
-            return True
-        else:
-            ee.Initialize()
-            return True
-    except Exception as exc:
-        logger.warning(f"Earth Engine initialization failed: {exc}")
-        return False
-
-ee_available = init_earth_engine_eager()
-
-# ==============================================================================
-# 2. PILOT GEOGRAPHIC HIERARCHY & STRICT ROI BUILDER
-# ==============================================================================
-PILOT_HIERARCHY: Dict[str, Dict[str, list]] = {
-    "Rubavu": {
-        "Gisenyi": ["Amahoro", "Nengo", "Kigufi", "Bugoyi"],
-        "Rugerero": ["Gisa", "Kaba", "Rugerero"],
-        "Rubavu": ["Buhaza", "Rukoko"]
-    },
-    "Kayonza": {
-        "Mukarange": ["Kayonza", "Bwiza", "Nyagatovu"],
-        "Gahini": ["Juru", "Kahi", "Kiyenzi"],
-        "Kabare": ["Cyerwa", "Rubimba"]
-    },
-    "Kirehe": {
-        "Kirehe": ["Kigina", "Gatore"],
-        "Gatore": ["Curazo", "Rwizi"],
-        "Mahama": ["Munini", "Sarambuye"]
-    },
-    "Nyagatare": {
-        "Nyagatare": ["Bare", "Gacurabwenge"],
-        "Mimuri": ["Mimuri", "Mahoro"],
-        "Rukomo": ["Rukomo", "Rwenyana"]
-    }
+DISTRICT_SECTORS: dict[str, list[str]] = {
+    "Rubavu":    ["Gisenyi", "Rugerero", "Rubavu", "Kanama", "Nyamyumba", "Cyanzarwe", "Bugeshi"],
+    "Kayonza":   ["Mukarange", "Ruramira", "Nyamirama", "Kabare", "Gahini", "Murama", "Rukara"],
+    "Kirehe":    ["Kirehe", "Gahara", "Nyamugari", "Mahama", "Mpanga", "Musaza", "Kigarama"],
+    "Nyagatare": ["Nyagatare", "Tabagwe", "Karama", "Matimba", "Rwempasha", "Musheri", "Mimuri"],
 }
 
-def build_roi(district: str, sector: str, cell: str) -> Tuple[Any, str, str, list]:
-    bounds = {
-        "Rubavu": [29.23, -1.72, 29.35, -1.62],
-        "Kayonza": [30.45, -2.00, 30.80, -1.70],
-        "Kirehe": [30.60, -2.40, 30.90, -2.10],
-        "Nyagatare": [30.20, -1.60, 30.60, -1.10]
-    }
-    base_box = bounds.get(district, [29.23, -1.72, 29.35, -1.62])
-    
+SECTOR_CELLS: dict[str, list[str]] = {
+    "Gisenyi": ["Amahoro", "Bugoyi", "Kivumu", "Mbugangari", "Nengo", "Rubavu", "Umuganda"],
+    "Rugerero": ["Basa", "Gisa", "Kabilizi", "Muhira", "Rugerero", "Rushubi", "Rwaza"],
+    "Rubavu": ["Buhaza", "Burinda", "Byahi", "Gikombe", "Murambi", "Murara", "Rukoko"],
+    "Kanama": ["Kamuhoza", "Karambo", "Mahoko", "Musabike", "Nkomane", "Rusongati", "Yungwe"],
+    "Nyamyumba": ["Burushya", "Busoro", "Kinigi", "Kiraga", "Munanira", "Rubona"],
+    "Cyanzarwe": ["Busigari", "Cyanzarwe", "Gora", "Kinyanzovu", "Makurizo", "Rwangara", "Rwanzekuma", "Ryabizige"],
+    "Bugeshi": ["Buringo", "Butaka", "Hehu", "Kabumba", "Mutovu", "Nsherima", "Rusiza"],
+    "Mukarange": ["Bwiza", "Kayonza", "Mburabuturo", "Nyagatovu", "Rugendabari"],
+    "Ruramira": ["Bugambira", "Nkamba", "Ruyonza", "Umubuga"],
+    "Nyamirama": ["Gikaya", "Musumba", "Rurambi", "Shyogo"],
+    "Kabare": ["Cyarubare", "Gitara", "Kirehe", "Rubimba", "Rubumba"],
+    "Gahini": ["Juru", "Kahi", "Kiyenzi", "Urugarama"],
+    "Murama": ["Gitaraga", "Kigabiro", "Mvumba", "Rurenge", "Sakara"],
+    "Rukara": ["Kawangire", "Rukara", "Rwimishinya"],
+    "Kirehe": ["Gahama", "Kirehe", "Nyabigega", "Nyabikokora", "Rwesero"],
+    "Gahara": ["Butezi", "Muhamba", "Murehe", "Nyagasenyi", "Nyakagezi", "Rubimba"],
+    "Nyamugari": ["Bukora", "Kagasa", "Kazizi", "Kiyanzi", "Nyamugari"],
+    "Mahama": ["Kamombo", "Mwoga", "Saruhembe", "Umunini"],
+    "Mpanga": ["Bwiyorere", "Kankobwa", "Mpanga", "Mushongi", "Nasho", "Nyakabungo", "Rubaya"],
+    "Musaza": ["Gasarabwayi", "Kabuga", "Mubuga", "Musaza", "Nganda"],
+    "Kigarama": ["Cyanya", "Kigarama", "Kiremera", "Nyakerera", "Nyankurazo"],
+    "Nyagatare": ["Barija", "Bushoga", "Cyabayaga", "Gakirage", "Kamagiri", "Nsheke", "Nyagatare", "Rutaraka", "Ryabega"],
+    "Tabagwe": ["Gishuro", "Gitengure", "Nkoma", "Nyabitekeri", "Nyagatoma", "Shonga", "Tabagwe"],
+    "Karama": ["Bushara", "Cyenkwanzi", "Gikagati", "Gikundamvura", "Kabuga", "Ndego", "Nyakiga"],
+    "Matimba": ["Bwera", "Byimana", "Cyembogo", "Kagitumba", "Kanyonza", "Matimba", "Nyabwishongwezi", "Rwentanga"],
+    "Rwempasha": ["Cyenjonjo", "Gasinga", "Kabare", "Kazaza", "Mishenyi", "Rugarama", "Rukorota", "Rutare", "Rwempasha", "Ryeru"],
+    "Musheri": ["Kibirizi", "Kijojo", "Musheri", "Ntoma", "Nyagatabire", "Nyamiyonga", "Rugarama i", "Rugarama ii"],
+    "Mimuri": ["Bibare", "Gakoma", "Mahoro", "Mimuri", "Rugari"],
+}
+
+_SECTOR_GEOM_PATH = os.path.join(os.path.dirname(__file__), "rwanda_sectors.json")
+_CELL_GEOM_PATH   = os.path.join(os.path.dirname(__file__), "rwanda_cells.json")
+
+@lru_cache(maxsize=1)
+def _load_sector_geometries() -> dict:
+    try:
+        with open(_SECTOR_GEOM_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+@lru_cache(maxsize=1)
+def _load_cell_geometries() -> dict:
+    try:
+        with open(_CELL_GEOM_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+SEVERE_STRESS_ZSCORE = -1.0 
+SOC_CONVERSION_FACTOR  = 10.0
+MAX_CLOUD_PCT         = 30
+WET_MONTHS            = {3, 4, 5, 10, 11, 12}
+WORLDCOVER_CROPLAND    = 40
+
+HIGH_ALERT_PCT     = 15.0
+MODERATE_ALERT_PCT =  5.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHED RESOURCES & HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_supabase() -> Client | None:
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        logger.error("Supabase init failed: %s", exc)
+        return None
+
+@st.cache_resource(show_spinner=False)
+def init_earth_engine() -> bool:
+    try:
+        if "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            credentials = ee.ServiceAccountCredentials(
+                creds_dict["client_email"], key_data=json.dumps(creds_dict)
+            )
+            ee.Initialize(credentials, project=EE_PROJECT)
+        elif "EE_PRIVATE_KEY_JSON" in st.secrets:
+            key_json = st.secrets.get("EE_PRIVATE_KEY_JSON")
+            key_data = json.loads(key_json)
+            credentials = ee.ServiceAccountCredentials(
+                key_data["client_email"], key_data=key_data
+            )
+            ee.Initialize(credentials, project=EE_PROJECT)
+        else:
+            ee.Initialize(project=EE_PROJECT)
+        _ = ee.Number(1).add(1).getInfo()
+        return True
+    except Exception as exc:
+        logger.error("Earth Engine init failed: %s", exc)
+        return False
+
+def add_ee_layer(fmap: folium.Map, ee_image: ee.Image, vis_params: dict, name: str) -> None:
+    map_id_dict = ee.Image(ee_image).getMapId(vis_params)
+    folium.TileLayer(
+        tiles=map_id_dict["tile_fetcher"].url_format,
+        attr="Google Earth Engine",
+        name=name,
+        overlay=True,
+        control=True,
+    ).add_to(fmap)
+
+def build_roi(district: str, sector: str, cell: str | None = None) -> tuple[ee.Geometry, bool]:
+    gaul = ee.FeatureCollection("FAO/GAUL/2015/level2")
+    district_geom = gaul.filter(
+        ee.Filter.And(
+            ee.Filter.eq("ADM0_NAME", "Rwanda"),
+            ee.Filter.eq("ADM2_NAME", district),
+        )
+    ).geometry()
+
     if cell and cell != "All Cells":
-        analysis_level = "cell"
-        label_text = f"{district} ➔ {sector} ➔ Cell: {cell}"
-        coords = [base_box[0] + 0.01, base_box[1] + 0.01, base_box[0] + 0.03, base_box[1] + 0.03]
-    elif sector and sector != "All Sectors":
-        analysis_level = "sector"
-        label_text = f"{district} ➔ Sector: {sector}"
-        coords = [base_box[0], base_box[1], base_box[0] + 0.06, base_box[1] + 0.06]
+        cell_geoms = _load_cell_geometries()
+        if cell in cell_geoms:
+            try:
+                candidate = ee.Geometry(cell_geoms[cell])
+                roi = district_geom.intersection(candidate, maxError=10)
+                area = roi.area(maxError=100).getInfo()
+                if area > 0:
+                    return roi, True
+            except Exception as exc:
+                logger.warning("Cell ROI failed (%s), falling back to sector: %s", cell, exc)
+
+    if sector and sector != "All Sectors":
+        sector_geoms = _load_sector_geometries()
+        if sector in sector_geoms:
+            try:
+                candidate = ee.Geometry(sector_geoms[sector])
+                roi = district_geom.intersection(candidate, maxError=10)
+                area = roi.area(maxError=100).getInfo()
+                if area > 0:
+                    return roi, True
+            except Exception as exc:
+                logger.warning("Sector ROI failed (%s), falling back to district: %s", sector, exc)
+        candidate = district_geom.centroid(maxError=1).buffer(5_000)
+        return district_geom.intersection(candidate, maxError=10), True
+
+    return district_geom, False
+
+def _is_wet_season(start: date, end: date) -> bool:
+    mid_month = ((start.month + end.month) // 2) or start.month
+    return mid_month in WET_MONTHS
+
+def _get_cropland_mask(roi: ee.Geometry) -> ee.Image:
+    return (
+        ee.Image("ESA/WorldCover/v200/2021")
+        .select("Map")
+        .clip(roi)
+        .eq(WORLDCOVER_CROPLAND)
+    )
+
+def _add_ndvi(img: ee.Image) -> ee.Image:
+    ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    ndmi = img.normalizedDifference(["B8", "B11"]).rename("NDMI")
+    return img.addBands([ndvi, ndmi])
+
+def compute_ndvi_anomaly(
+    roi: ee.Geometry,
+    start: date,
+    end: date,
+) -> tuple[ee.Image | None, float, float, float, float, int]:
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(roi)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD_PCT))
+    )
+    total_count = s2.size().getInfo()
+    if total_count == 0:
+        return None, 0.0, 0.0, 0.0, 0.0, 0
+
+    water_mask    = s2.first().normalizedDifference(["B3", "B8"]).lte(0.0)
+    crop_mask     = _get_cropland_mask(roi)
+    combined_mask = water_mask.And(crop_mask)
+
+    s2_both = s2.map(_add_ndvi)
+    wet      = _is_wet_season(start, end)
+
+    if wet:
+        baseline_filter = ee.Filter.Or(
+            ee.Filter.calendarRange(3, 5, "month"),
+            ee.Filter.calendarRange(10, 12, "month"),
+        )
     else:
-        analysis_level = "district"
-        label_text = f"District: {district}"
-        coords = base_box
+        baseline_filter = ee.Filter.Or(
+            ee.Filter.calendarRange(1, 2, "month"),
+            ee.Filter.calendarRange(6, 9, "month"),
+        )
 
-    roi = ee.Geometry.Rectangle(coords) if ee_available else coords
-    return roi, analysis_level, label_text, coords
+    baseline_ic = (s2_both.select(["NDVI","NDMI"])
+                   .filterDate("2019-01-01", "2024-12-31")
+                   .filter(baseline_filter))
 
-# ==============================================================================
-# 3. CACHED EARTH ENGINE COMPUTATIONS
-# ==============================================================================
-@st.cache_data(ttl=3600)
-def compute_eo_metrics(district: str, sector: str, cell: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    if not ee_available:
-        return {
-            "mean_ndvi": 0.682, "baseline_ndvi": 0.724, "ndvi_anomaly": -0.042,
-            "mean_ndmi": -0.085, "rainfall_total": 142.5, "rainfall_anomaly": -12.4,
-            "soil_soc": 24.5, "stressed_km2": 11.3, "total_cropland_km2": 166.3,
-            "stress_pct": 6.8, "image_count": 19, "data_confidence": "HIGH"
+    current_ic  = s2_both.filterDate(str(start), str(end))
+    n_images    = current_ic.size().getInfo()
+
+    masked_baseline = baseline_ic.map(lambda img: img.updateMask(combined_mask))
+    mean_img = masked_baseline.mean()
+    std_img  = masked_baseline.reduce(ee.Reducer.stdDev()).rename(["NDVI", "NDMI"])
+
+    baseline_stats = mean_img.select("NDVI").reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
+    )
+    baseline_mean = float(
+        ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
+    )
+
+    current_ndvi = current_ic.select("NDVI").median().updateMask(combined_mask)
+    current_ndmi = current_ic.select("NDMI").median().updateMask(combined_mask)
+
+    ndvi_std = std_img.select("NDVI").rename("NDVI")
+    z_score  = current_ndvi.subtract(mean_img.select("NDVI")).divide(ndvi_std.max(0.01)).rename("z_score").clip(roi)
+
+    ndmi_baseline_mean = mean_img.select("NDMI")
+    ndmi_anomaly_img   = current_ndmi.subtract(ndmi_baseline_mean).clip(roi)
+    ndmi_stats = ndmi_anomaly_img.updateMask(combined_mask).reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8
+    )
+    ndmi_mean = float(ee.Number(ndmi_stats.get("NDMI", ee.Number(0))).getInfo() or 0.0)
+
+    stress_mask = z_score.lt(SEVERE_STRESS_ZSCORE)
+    area_dict   = (
+        ee.Image.pixelArea().divide(1e6)
+        .updateMask(stress_mask)
+        .reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=20, maxPixels=1e9)
+    )
+    stress_km2 = round(
+        float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
+    )
+
+    return z_score, stress_km2, baseline_mean, ndmi_mean, 0.0, n_images
+
+def compute_rain_anomaly(roi: ee.Geometry, start: date, end: date) -> ee.Image:
+    chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(roi)
+    current_sum     = chirps.filterDate(str(start), str(end)).select("precipitation").sum()
+    historical_avg = (
+        chirps.filterDate("2020-01-01", "2024-12-31").select("precipitation").sum().divide(5)
+    )
+    return current_sum.subtract(historical_avg).divide(historical_avg).multiply(100).clip(roi)
+
+def get_soc_layer(roi: ee.Geometry) -> ee.Image:
+    return (
+        ee.Image("projects/soilgrids-isric/soc_mean")
+        .select("soc_0-5cm_mean")
+        .divide(SOC_CONVERSION_FACTOR)
+        .clip(roi)
+    )
+
+def compute_rain_stats(roi: ee.Geometry, start: date, end: date) -> tuple[float, str]:
+    try:
+        chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(roi)
+        current_sum    = chirps.filterDate(str(start), str(end)).select("precipitation").sum()
+        historical_avg = chirps.filterDate("2020-01-01","2024-12-31").select("precipitation").sum().divide(5)
+        anomaly_img    = current_sum.subtract(historical_avg).divide(historical_avg).multiply(100).clip(roi)
+        stats = anomaly_img.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=5000, maxPixels=1e8
+        )
+        val = ee.Number(stats.get("precipitation", ee.Number(0))).getInfo()
+        pct = round(float(val or 0), 1)
+        if pct < -20:
+            label = "🔴 Rainfall Deficit"
+        elif pct < -10:
+            label = "🟡 Below Normal"
+        elif pct > 20:
+            label = "🔵 Above Normal"
+        else:
+            label = "🟢 Near Normal"
+        return pct, label
+    except Exception:
+        return 0.0, "—"
+
+def compute_soc_stats(roi: ee.Geometry) -> tuple[float, str]:
+    try:
+        crop_mask = _get_cropland_mask(roi)
+        soc = (
+            ee.Image("projects/soilgrids-isric/soc_mean")
+            .select("soc_0-5cm_mean")
+            .divide(SOC_CONVERSION_FACTOR)
+            .updateMask(crop_mask)
+            .clip(roi)
+        )
+        stats = soc.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=250, maxPixels=1e8
+        )
+        val = ee.Number(stats.get("soc_0-5cm_mean", ee.Number(0))).getInfo()
+        soc_val = round(float(val or 0), 1)
+        if soc_val < 20:
+            label = "🔴 Low SOC (<20 g/kg)"
+        elif soc_val < 40:
+            label = "🟡 Medium SOC (20-40 g/kg)"
+        else:
+            label = "🟢 High SOC (>40 g/kg)"
+        return soc_val, label
+    except Exception:
+        return 0.0, "—"
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_total_cropland_km2(district: str, sector: str = "All Sectors", cell: str | None = None) -> float:
+    roi, _ = build_roi(district, sector, cell)
+    crop_mask = _get_cropland_mask(roi)
+    area_dict = (
+        ee.Image.pixelArea().divide(1e6)
+        .updateMask(crop_mask)
+        .reduceRegion(reducer=ee.Reducer.sum(), geometry=roi, scale=100, maxPixels=1e9)
+    )
+    return round(
+        float(ee.Number(area_dict.get("area", ee.Number(0))).getInfo() or 0.0), 1
+    )
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_ndvi_timeseries(
+    district: str, sector: str, start_str: str, end_str: str, cell: str | None = None
+) -> tuple[pd.DataFrame, float]:
+    roi, _ = build_roi(district, sector, cell)
+    start  = date.fromisoformat(start_str)
+    end    = date.fromisoformat(end_str)
+    wet    = _is_wet_season(start, end)
+
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(roi)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD_PCT))
+        .map(_add_ndvi)
+    )
+
+    ic = s2.filterDate(start_str, end_str)
+    if ic.size().getInfo() == 0:
+        return pd.DataFrame(), 0.0
+
+    crop_mask = _get_cropland_mask(roi)
+
+    def extract_mean(img: ee.Image) -> ee.Feature:
+        masked   = img.select("NDVI").updateMask(crop_mask)
+        mean_val = masked.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8,
+        )
+        return ee.Feature(None, {"date": img.date().format("YYYY-MM-dd"), "NDVI": mean_val.get("NDVI")})
+
+    fc      = ic.map(extract_mean).filter(ee.Filter.notNull(["NDVI"]))
+    records = [f["properties"] for f in fc.getInfo()["features"]]
+    if not records:
+        return pd.DataFrame(), 0.0
+
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.groupby("date")["NDVI"].mean().reset_index().sort_values("date").set_index("date")
+
+    baseline_ic = s2.filterDate("2019-01-01", "2024-12-31").filter(
+        ee.Filter.Or(
+            ee.Filter.calendarRange(3, 5, "month"),
+            ee.Filter.calendarRange(10, 12, "month"),
+        )
+    ) if wet else s2.filterDate("2019-01-01", "2024-12-31").filter(
+        ee.Filter.Or(
+            ee.Filter.calendarRange(1, 2, "month"),
+            ee.Filter.calendarRange(6, 9, "month"),
+        )
+    )
+
+    baseline_stats = (
+        baseline_ic.select("NDVI").median().updateMask(crop_mask)
+        .reduceRegion(reducer=ee.Reducer.mean(), geometry=roi, scale=100, maxPixels=1e8)
+    )
+    baseline_mean = float(
+        ee.Number(baseline_stats.get("NDVI", ee.Number(0))).getInfo() or 0.0
+    )
+
+    df["Seasonal Baseline"] = baseline_mean
+    return df, baseline_mean
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING & ESTIMATOR HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def log_alert_to_supabase(
+    supabase: Client | None,
+    district: str,
+    sector: str,
+    cell: str | None,
+    season: str,
+    stress_km2: float,
+    stress_pct: float,
+    baseline_ndvi: float,
+    ndmi_mean: float,
+    n_images: int,
+    alert_label: str
+) -> None:
+    """Logs stress alerts to Supabase audit trail."""
+    if not supabase or stress_pct < MODERATE_ALERT_PCT:
+        return
+
+    try:
+        payload = {
+            "district": district,
+            "sector": sector,
+            "cell": cell or "All Cells",
+            "season": season,
+            "stress_km2": stress_km2,
+            "stress_pct": stress_pct,
+            "baseline_ndvi": round(baseline_ndvi, 3),
+            "ndmi_anomaly": round(ndmi_mean, 3),
+            "satellite_coverage": n_images,
+            "alert_level": alert_label,
         }
+        supabase.table("alert_logs").insert(payload).execute()
+    except Exception as exc:
+        logger.warning(f"Failed to log alert to Supabase: {exc}")
 
-    roi, analysis_level, _, _ = build_roi(district, sector, cell)
-
-    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-          .filterBounds(roi)
-          .filterDate(start_date, end_date)
-          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 25)))
-
-    image_count = s2.size().getInfo()
-
-    if image_count == 0:
-        return {
-            "mean_ndvi": 0.0, "baseline_ndvi": 0.0, "ndvi_anomaly": 0.0,
-            "mean_ndmi": 0.0, "rainfall_total": 0.0, "rainfall_anomaly": 0.0,
-            "soil_soc": 0.0, "stressed_km2": 0.0, "total_cropland_km2": 0.0,
-            "stress_pct": 0.0, "image_count": 0, "data_confidence": "LOW (NO SATELLITE COVERAGE)"
-        }
-
-    composite = s2.median().clip(roi)
-    ndvi = composite.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    ndmi = composite.normalizedDifference(["B8", "B11"]).rename("NDMI")
-
-    baseline_s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-                   .filterBounds(roi)
-                   .filter(ee.Filter.calendarRange(1, 12, "month"))
-                   .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 25))
-                   .select(["B8", "B4"]))
+def render_yield_impact_estimator(stress_km2: float, stress_pct: float):
+    """Calculates estimated crop losses based on stressed area."""
+    st.markdown("### 💰 Yield Loss & Economic Impact Estimator")
     
-    baseline_ndvi = baseline_s2.map(lambda img: img.normalizedDifference(["B8", "B4"])).median().clip(roi)
-    ndvi_anomaly = ndvi.subtract(baseline_ndvi).rename("NDVI_Anomaly")
+    if stress_km2 <= 0:
+        st.info("No active cropland stress detected. Projected crop yields are nominal.")
+        return
 
-    chirps = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-              .filterBounds(roi)
-              .filterDate(start_date, end_date)
-              .select("precipitation"))
-    rainfall_total_img = chirps.sum().clip(roi)
-
-    soc_img = ee.Image("projects/soilgrids-isric/soc_mean").clip(roi)
-
-    stats = ee.Image.cat([ndvi, baseline_ndvi, ndvi_anomaly, ndmi, rainfall_total_img, soc_img]).reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=roi,
-        scale=30,
-        maxPixels=1e9
-    ).getInfo()
-
-    mean_ndvi = stats.get("NDVI", 0.0) or 0.0
-    base_ndvi = stats.get("NDVI_1", 0.0) or 0.0
-    anom_ndvi = stats.get("NDVI_Anomaly", 0.0) or 0.0
-    mean_ndmi = stats.get("NDMI", 0.0) or 0.0
-    total_rain = stats.get("precipitation", 0.0) or 0.0
-    mean_soc = (stats.get("soc_mean", 0.0) or 0.0) / 10.0
-
-    stressed_mask = ndvi_anomaly.lt(-0.10)
-    pixel_area = ee.Image.pixelArea().updateMask(stressed_mask)
-    stressed_area_m2 = pixel_area.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=roi,
-        scale=30,
-        maxPixels=1e9
-    ).get("area", 0.0).getInfo() or 0.0
-
-    total_area_m2 = roi.area().getInfo() or 1.0
-    
-    stressed_km2 = stressed_area_m2 / 1e6
-    total_cropland_km2 = total_area_m2 / 1e6
-    stress_pct = (stressed_km2 / total_cropland_km2) * 100 if total_cropland_km2 > 0 else 0.0
-
-    return {
-        "mean_ndvi": round(mean_ndvi, 3),
-        "baseline_ndvi": round(base_ndvi, 3),
-        "ndvi_anomaly": round(anom_ndvi, 3),
-        "mean_ndmi": round(mean_ndmi, 3),
-        "rainfall_total": round(total_rain, 1),
-        "rainfall_anomaly": -8.5,
-        "soil_soc": round(mean_soc, 1),
-        "stressed_km2": round(stressed_km2, 2),
-        "total_cropland_km2": round(total_cropland_km2, 1),
-        "stress_pct": round(stress_pct, 1),
-        "image_count": image_count,
-        "data_confidence": "HIGH" if image_count >= 5 else "MODERATE"
+    crop_defaults = {
+        "Maize 🌽": {"yield_ha": 2.5, "price_per_kg": 350},
+        "Beans 🫘": {"yield_ha": 1.2, "price_per_kg": 600},
+        "Irish Potato 🥔": {"yield_ha": 12.0, "price_per_kg": 250},
     }
 
-@st.cache_data(ttl=3600)
-def fetch_time_series_data(district: str, sector: str, cell: str, start_date: str, end_date: str) -> pd.DataFrame:
-    dates = pd.date_range(start=start_date, end=end_date, freq="14D")
-    np.random.seed(42)
+    c1, c2 = st.columns([1, 2])
     
-    base_trend = 0.55 + 0.15 * np.sin(np.linspace(0, 3.14, len(dates)))
-    actual_ndvi = base_trend + np.random.normal(0, 0.03, len(dates))
-    actual_ndvi = np.clip(actual_ndvi, 0.2, 0.85)
-    
-    df = pd.DataFrame({
-        "Date": dates,
-        "NDVI": actual_ndvi,
-        "Seasonal Baseline": base_trend
-    })
-    return df
+    with c1:
+        selected_crop = st.selectbox("Crop Type", list(crop_defaults.keys()))
+        loss_severity = st.slider("Estimated Stress Impact Severity (%)", 10, 80, 30, step=5)
 
-# ==============================================================================
-# 4. SUPABASE PERSISTENCE & SMS DISPATCH
-# ==============================================================================
-def log_alert_to_supabase(
-    supabase: Optional[Client], district: str, sector: str, cell: str,
-    season: str, stress_km2: float, stress_pct: float, baseline_ndvi: float,
-    ndmi_mean: float, n_images: int, alert_label: str
-) -> None:
+    params = crop_defaults[selected_crop]
+    stressed_hectares = stress_km2 * 100
+    potential_yield_tons = stressed_hectares * params["yield_ha"]
+    lost_tons = potential_yield_tons * (loss_severity / 100.0)
+    lost_rwf = lost_tons * 1000 * params["price_per_kg"]
+
+    with c2:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Stressed Cropland", f"{stressed_hectares:,.0f} Ha")
+        m2.metric("Projected Yield Loss", f"{lost_tons:,.1f} MT", delta=f"-{loss_severity}%", delta_color="inverse")
+        m3.metric("Est. Economic Loss", f"{lost_rwf/1e6:,.1f}M RWF", delta="Risk Value", delta_color="inverse")
+        
+        st.caption(
+            f"*Base parameters: {params['yield_ha']} MT/Ha yield at {params['price_per_kg']} RWF/kg market price.*"
+        )
+
+def generate_field_report_html(
+    location_label: str,
+    district: str,
+    sector: str,
+    cell: str | None,
+    season_label: str,
+    stress_km2: float,
+    stress_pct: float,
+    total_cropland_km2: float,
+    alert_label: str,
+    ndmi_mean: float,
+    n_images: int
+) -> str:
+    """Generates a printable HTML field summary report."""
+    return f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #333; }}
+            .header {{ border-bottom: 2px solid #2c7bb6; padding-bottom: 10px; margin-bottom: 20px; }}
+            .title {{ font-size: 22px; font-weight: bold; color: #1d4ed8; }}
+            .subtitle {{ font-size: 14px; color: #666; }}
+            .section {{ margin-top: 20px; font-size: 16px; font-weight: bold; border-bottom: 1px solid #ddd; padding-bottom: 5px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+            th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; font-size: 13px; }}
+            th {{ background-color: #f2f2f2; }}
+            .alert {{ font-weight: bold; color: {'#d7191c' if stress_pct > 15 else '#fdae61'}; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="title">Agri-Scan Rwanda — Field Situation Report</div>
+            <div class="subtitle">Generated on: {date.today().isoformat()} | Target Area: {location_label}</div>
+        </div>
+        
+        <div class="section">1. Location & Environmental Profile</div>
+        <table>
+            <tr><th>District</th><td>{district}</td><th>Sector</th><td>{sector}</td></tr>
+            <tr><th>Cell</th><td>{cell or 'All Cells'}</td><th>Season Status</th><td>{season_label}</td></tr>
+        </table>
+
+        <div class="section">2. Vegetation Stress Diagnostics</div>
+        <table>
+            <tr><th>Total Cropland</th><td>{total_cropland_km2} km²</td><th>Stressed Cropland</th><td>{stress_km2} km² ({stress_pct}%)</td></tr>
+            <tr><th>NDMI Water Departure</th><td>{ndmi_mean:+.3f}</td><th>Satellite Scene Count</th><td>{n_images} scenes</td></tr>
+            <tr><th>Alert Level Status</th><td colspan="3" class="alert">{alert_label}</td></tr>
+        </table>
+
+        <div class="section">3. Actionable Field Recommendations</div>
+        <ul>
+            <li>Dispatch local extension officers to inspect designated stressed sectors.</li>
+            <li>Verify canopy moisture levels against local ground observations.</li>
+            <li>Prioritize irrigation scheduling in sectors with negative NDMI departures.</li>
+        </ul>
+    </body>
+    </html>
+    """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAP LEGEND HTML
+# ─────────────────────────────────────────────────────────────────────────────
+NDVI_LEGEND_HTML = """
+<div style="
+    position: fixed; top: 80px; right: 10px;
+    width: 230px; padding: 12px; border-radius: 6px;
+    border: 2px solid #555; background: rgba(255,255,255,0.95);
+    font-size: 12px; font-family: sans-serif; z-index: 9999;
+    box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
+  <b>Vegetation Z-Score Anomaly</b>
+  <span style="color:#555;font-size:10px;"> (cropland only)</span><br><br>
+  <span style="display:inline-block;width:14px;height:14px;background:#d7191c;margin-right:6px;border-radius:2px;"></span>Severe Stress (&lt;&minus;1.0 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#fdae61;margin-right:6px;border-radius:2px;"></span>Mild Stress (&minus;1.0 to &minus;0.5 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#ffffbf;margin-right:6px;border-radius:2px;border:1px solid #ccc;"></span>Normal (&plusmn;0.5 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#abd9e9;margin-right:6px;border-radius:2px;"></span>Good Vigor (+0.5 to +1.0 &sigma;)<br>
+  <span style="display:inline-block;width:14px;height:14px;background:#2c7bb6;margin-right:6px;border-radius:2px;"></span>High Vigor (&gt;+1.0 &sigma;)<br>
+  <hr style="margin:6px 0;border-color:#ddd;">
+  <span style="font-size:10px;color:#666;">Sentinel-2 Z-Score · ESA WorldCover</span>
+</div>
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    st.title("🌾 Agri-Scan Rwanda: Crop Health & Climate Intelligence")
+    st.markdown(
+        "Real-time Earth Observation & Food Security Monitoring — "
+        "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover"
+    )
+
+    if not init_earth_engine():
+        st.error("⚠️ Earth Engine could not be initialised. Ensure credentials are correct.")
+        st.stop()
+
+    supabase = get_supabase()
+
+    # Sidebar Inputs
+    st.sidebar.header("📍 Location & Search")
+    district = st.sidebar.selectbox("District", list(DISTRICT_SECTORS.keys()))
+    sector   = st.sidebar.selectbox("Sector (Umurenge)", ["All Sectors"] + DISTRICT_SECTORS[district])
+    
+    if sector and sector != "All Sectors" and sector in SECTOR_CELLS:
+        available_cells = SECTOR_CELLS[sector]
+    else:
+        available_cells = []
+    cell_options = ["All Cells"] + sorted(available_cells)
+    selected_cell = st.sidebar.selectbox("Cell (Akagari)", cell_options)
+    cell = None if selected_cell == "All Cells" else selected_cell
+
+    st.sidebar.markdown("---")
+    village = st.sidebar.text_input("Village (Umudugudu)", placeholder="e.g., Ubumwe")
+
+    st.sidebar.markdown("---")
+    upi_input = st.sidebar.text_input("🆔 UPI (Parcel ID)", placeholder="e.g., 3/03/04/01/123")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("📅 Date Range")
+    default_end   = date.today() - timedelta(days=1)
+    default_start = default_end.replace(month=1, day=1)
+    start_date = st.sidebar.date_input("Start", default_start)
+    end_date   = st.sidebar.date_input("End",   default_end)
+
+    if start_date >= end_date:
+        st.sidebar.error("Start date must be before end date.")
+        st.stop()
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("🛰️ Map Layers")
+    show_ndvi = st.sidebar.checkbox("Crop Vigor Z-Score Anomaly (Sentinel-2)", value=True)
+    show_rain = st.sidebar.checkbox("Rainfall Anomaly % (CHIRPS)",    value=False)
+    show_soc  = st.sidebar.checkbox("Soil Organic Carbon (SoilGrids)", value=False)
+
+    roi, is_sector_mode = build_roi(district, sector, cell)
+    location_label = cell if (cell and cell != 'All Cells') else (sector if is_sector_mode else district)
+    wet            = _is_wet_season(start_date, end_date)
+    season_label   = "🌧️ Wet Season" if wet else "☀️ Dry Season"
+
+    with st.spinner("Computing geospatial indicators..."):
+        ndvi_anomaly, stress_km2, baseline_mean, ndmi_mean, rain_pct_dummy, n_images = compute_ndvi_anomaly(roi, start_date, end_date)
+        total_cropland_km2 = get_total_cropland_km2(district, sector, cell)
+        stress_pct = round((stress_km2 / total_cropland_km2 * 100), 1) if total_cropland_km2 > 0 else 0.0
+        rain_anomaly = compute_rain_anomaly(roi, start_date, end_date)
+        soc_layer = get_soc_layer(roi)
+        rain_pct, rain_label = compute_rain_stats(roi, start_date, end_date) if show_rain else (0.0, "—")
+        soc_val, soc_label   = compute_soc_stats(roi) if show_soc else (0.0, "—")
+
+    map_center = [-1.9403, 29.8739]
+    zoom_level = 11
+    parcel_data = None
+    upi = upi_input.strip()
+
+    if upi and supabase:
+        try:
+            resp = supabase.table("parcels").select("*").eq("upi", upi).execute()
+            if resp.data:
+                parcel_data = resp.data[0]
+                map_center  = [parcel_data["latitude"], parcel_data["longitude"]]
+                zoom_level  = 18
+                st.sidebar.success(f"🎯 {parcel_data.get('village','')} ({parcel_data.get('sector','')})")
+            else:
+                st.sidebar.warning(f"UPI '{upi}' not found.")
+        except Exception as exc:
+            st.sidebar.error(f"Supabase: {exc}")
+
+    if parcel_data is None:
+        try:
+            coords     = roi.centroid(maxError=1).coordinates().getInfo()
+            map_center = [coords[1], coords[0]]
+            zoom_level = 14 if is_sector_mode else 11
+        except Exception:
+            pass
+
+    # KPI Row
+    if stress_pct > HIGH_ALERT_PCT:
+        alert_label, alert_color = "🔴 High Alert", "inverse"
+    elif stress_pct > MODERATE_ALERT_PCT:
+        alert_label, alert_color = "🟡 Moderate Alert", "off"
+    else:
+        alert_label, alert_color = "🟢 Normal", "normal"
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Selected Area", location_label)
+    k2.metric("Season", season_label)
+    k3.metric("Cropland Stress", f"{stress_km2} km²  ({stress_pct}%)", delta=alert_label, delta_color=alert_color)
+    k4.metric("Total Cropland Area", f"{total_cropland_km2} km²", delta=f"Baseline NDVI {round(baseline_mean, 3)}" if baseline_mean else "—")
+
+    if show_rain or show_soc:
+        kr1, kr2 = st.columns(2)
+        if show_rain:
+            kr1.metric("Rainfall Anomaly", f"{rain_pct}%", delta=rain_label,
+                       delta_color="inverse" if rain_pct < -20 else ("off" if rain_pct < -10 else "normal"))
+        if show_soc:
+            kr2.metric("Soil Organic Carbon", f"{soc_val} g/kg", delta=soc_label,
+                       delta_color="inverse" if soc_val < 20 else ("off" if soc_val < 40 else "normal"))
+
+    # Confidence Score & Evidence Panel
+    if n_images >= 5:
+        confidence_label = "HIGH"
+    elif n_images >= 2:
+        confidence_label = "MEDIUM"
+    else:
+        confidence_label = "LOW"
+
+    st.markdown("### 🔍 Alert Diagnostic & Evidence Panel")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("NDMI Anomaly (Water Content)", f"{ndmi_mean:+.3f}")
+    col2.metric("Satellite Coverage", f"{n_images} images")
+    col3.metric("Data Confidence", confidence_label)
+
+    with st.expander("Why is this area flagging? (Multi-Indicator Analysis)"):
+        st.write(f"• **NDVI Anomaly:** Z-Score threshold evaluated across primary cropland area.")
+        st.write(f"• **Vegetation Canopy Water (NDMI):** Mean departure is **{ndmi_mean:+.3f}** relative to baseline.")
+        st.write(f"• **Data Quality:** Evaluated across **{n_images}** cloud-free Sentinel-2 scenes for this ROI.")
+
+    st.markdown("---")
+
+    # Map Creation
+    fmap = folium.Map(location=map_center, zoom_start=zoom_level, tiles="OpenStreetMap")
+    folium.TileLayer(
+        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        attr="Google",
+        name="Google Satellite Hybrid",
+    ).add_to(fmap)
+
+    try:
+        folium.GeoJson(
+            roi.getInfo(),
+            name=f"{location_label} Boundary",
+            style_function=lambda _: {
+                "fillColor":   "#ffd700" if is_sector_mode else "#2c7bb6",
+                "color":       "#ff8c00" if is_sector_mode else "#1d4ed8",
+                "weight":      3,
+                "fillOpacity": 0.15,
+            },
+            tooltip=f"{'Sector' if is_sector_mode else 'District'}: {location_label}",
+        ).add_to(fmap)
+    except Exception as exc:
+        logger.warning("ROI boundary error: %s", exc)
+
+    if parcel_data:
+        folium.Marker(
+            location=map_center,
+            popup=f"<b>UPI:</b> {upi}<br><b>Village:</b> {parcel_data.get('village','—')}",
+            icon=folium.Icon(color="red", icon="info-sign"),
+        ).add_to(fmap)
+
+    if show_ndvi and ndvi_anomaly is not None:
+        add_ee_layer(fmap, ndvi_anomaly, {"min": -2.0, "max": 2.0, "palette": ["d7191c", "fdae61", "ffffbf", "abd9e9", "2c7bb6"]}, "Crop Vigor Z-Score Anomaly")
+
+    if show_rain:
+        add_ee_layer(fmap, rain_anomaly, {"min": -50, "max": 50, "palette": ["a6611a", "dfc27d", "f5f5f5", "80cdc1", "018571"]}, "Rainfall Anomaly %")
+
+    if show_soc:
+        add_ee_layer(fmap, soc_layer, {"min": 5, "max": 60, "palette": ["f5f5f5", "c7e9c0", "74c476", "238b45", "00441b"]}, "Soil Organic Carbon (g/kg)")
+
+    folium.LayerControl(collapsed=False).add_to(fmap)
+    fmap.get_root().html.add_child(folium.Element(NDVI_LEGEND_HTML))
+
+    Draw(
+        export=False,
+        position="topleft",
+        draw_options={"polyline": False, "rectangle": True, "polygon": True, "circle": False, "marker": True, "circlemarker": False},
+    ).add_to(fmap)
+
+    map_data = st_folium(fmap, use_container_width=True, height=540, key="farm_map")
+
+    # Location Details Section
+    st.markdown("### 📍 Farm Location Details")
+    lc1, lc2, lc3, lc4 = st.columns(4)
+    lc1.metric("Sector (Umurenge)", location_label)
+    lc2.metric("Cell (Akagari)", cell or "Not specified")
+    lc3.metric("Village (Umudugudu)", village or "Not specified")
+    lc4.metric("UPI Parcel ID", upi or "Draw on map")
+
+    # Plot analytics based on drawn geometry
+    plot_z_val: float | None = None
+    if map_data and map_data.get("last_active_drawing"):
+        drawing = map_data["last_active_drawing"]
+        try:
+            geom_type = drawing["geometry"]["type"]
+            coords    = drawing["geometry"]["coordinates"]
+            farm_geom = ee.Geometry.Polygon(coords) if geom_type == "Polygon" else ee.Geometry.Point(coords).buffer(50)
+
+            if ndvi_anomaly is not None:
+                plot_area_ha = farm_geom.area(maxError=1).divide(10_000).getInfo()
+                plot_stats   = ndvi_anomaly.reduceRegion(reducer=ee.Reducer.mean(), geometry=farm_geom, scale=10, maxPixels=1e8).getInfo()
+                plot_z_val   = plot_stats.get("z_score")
+
+                st.markdown("### 🎯 Specific Plot Analytics")
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Plot Area", f"{round(plot_area_ha, 2)} ha")
+                pc2.metric("Z-Score Anomaly", f"{round(plot_z_val, 2)} σ" if plot_z_val is not None else "N/A")
+                if plot_z_val is not None:
+                    if plot_z_val < SEVERE_STRESS_ZSCORE:
+                        pc3.metric("Condition", "Severe Stress 🔴", delta="Action needed", delta_color="inverse")
+                    elif plot_z_val < -0.5:
+                        pc3.metric("Condition", "Mild Stress 🟡", delta="Monitor", delta_color="off")
+                    else:
+                        pc3.metric("Condition", "Healthy 🟢", delta="Good vigor")
+        except Exception as exc:
+            st.warning(f"Plot metrics error: {exc}")
+
+    st.markdown("---")
+
+    # Time-Series + Agronomic Advisory
+    chart_col, advisory_col = st.columns([2, 1])
+
+    with chart_col:
+        st.subheader(f"📈 Cropland NDVI — {location_label}  ({season_label})")
+        try:
+            with st.spinner("Fetching time-series…"):
+                ts_df, ts_baseline = get_ndvi_timeseries(district, sector, str(start_date), str(end_date), cell)
+
+            if ts_df.empty:
+                st.info("No cloud-free observations in the selected range.")
+            else:
+                st.line_chart(ts_df[["NDVI", "Seasonal Baseline"]], y_label="NDVI")
+                st.caption(f"Cropland NDVI · Baseline = {season_label} median 2019–2024 ({round(ts_baseline, 3)}).")
+        except Exception as exc:
+            st.warning(f"Time-series error: {exc}")
+
+    with advisory_col:
+        st.subheader("💡 Agronomic Advisory")
+        if stress_pct > HIGH_ALERT_PCT:
+            st.warning(f"**🔴 High Alert:** {stress_km2} km² (**{stress_pct}% of cropland**) under severe stress.")
+            st.markdown("- **Field inspection:** Dispatch extension agents.\n- **Irrigation:** Prioritise deficit zones.\n- **Fertiliser:** Check nitrogen in stressed parcels.")
+        elif stress_pct > MODERATE_ALERT_PCT:
+            st.info(f"**🟡 Moderate Alert:** {stress_km2} km² ({stress_pct}% of cropland) showing stress.")
+            st.markdown("- **Spot checks:** Visit highlighted cells within the week.\n- **Cross-check:** Compare with CHIRPS rainfall layer.")
+        else:
+            st.success(f"**🟢 Stable:** {stress_pct}% cropland stressed — within normal variation.")
+            st.markdown("- **Routine monitoring:** Continue bi-weekly tracking.")
+
+    # ── AUTOMATED DATABASE LOGGING ────────────────────────────────────────────
+    log_alert_to_supabase(
+        supabase=supabase,
+        district=district,
+        sector=sector,
+        cell=cell,
+        season=season_label,
+        stress_km2=stress_km2,
+        stress_pct=stress_pct,
+        baseline_ndvi=baseline_mean,
+        ndmi_mean=ndmi_mean,
+        n_images=n_images,
+        alert_label=alert_label
+    )
+
+    # ── YIELD LOSS ESTIMATOR ──────────────────────────────────────────────────
+    st.markdown("---")
+    render_yield_impact_estimator(stress_km2, stress_pct)
+
+    # ── FIELD REPORT GENERATOR ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📄 Field Situation Report Exporter")
+    report_html = generate_field_report_html(
+        location_label=location_label,
+        district=district,
+        sector=sector,
+        cell=cell,
+        season_label=season_label,
+        stress_km2=stress_km2,
+        stress_pct=stress_pct,
+        total_cropland_km2=total_cropland_km2,
+        alert_label=alert_label,
+        ndmi_mean=ndmi_mean,
+        n_images=n_images
+    )
+    st.download_button(
+        "📄 Download Printable Field Report (.html)",
+        data=report_html,
+        file_name=f"field_report_{location_label.lower().replace(' ','_')}.html",
+        mime="text/html"
+    )
+
+    # ── EXPORTS ───────────────────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.header("📥 Export")
+    try:
+        st.sidebar.download_button(
+            "⬇ Boundary (GeoJSON)",
+            data=json.dumps(roi.getInfo()),
+            file_name=f"boundary_{location_label.lower().replace(' ','_')}.geojson",
+            mime="application/json",
+        )
+    except Exception as exc:
+        st.sidebar.warning(f"GeoJSON unavailable: {exc}")
+
+    summary = pd.DataFrame([{
+        "District":              district,
+        "Sector":                sector,
+        "Cell":                  cell or "All",
+        "Season":                "Wet" if wet else "Dry",
+        "Start Date":            start_date,
+        "End Date":              end_date,
+        "Total Cropland km2":    total_cropland_km2,
+        "Stressed km2":          stress_km2,
+        "Stressed %":            stress_pct,
+        "Alert Level":           alert_label,
+        "Baseline NDVI":         round(baseline_mean, 3),
+        "NDMI Anomaly":          round(ndmi_mean, 3),
+        "Satellite Coverage":    n_images,
+        "Rainfall Anomaly %":    rain_pct,
+        "SOC g/kg":              soc_val,
+    }])
+    st.sidebar.download_button(
+        "⬇ Summary (CSV)",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name="agri_scan_summary.csv",
+        mime="text/csv",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "Agri-Scan Rwanda v4.0 · Nshuti Aimé · IUSS Pavia\n\n"
+        "Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover · geoBoundaries ADM3"
+    )
+
+if __name__ == "__main__":
+    main()
+# ── EXTENSIONS & ANALYTICAL MODULES ──────────────────────────────────────────
+import datetime
+
+def log_alert_to_supabase(supabase, district, sector, cell, season, stress_km2, stress_pct, baseline_ndvi, ndmi_mean, n_images, alert_label):
+    """Logs stress alerts to Supabase audit log."""
     if not supabase or stress_pct < 5.0:
         return
     try:
         payload = {
             "district": district,
             "sector": sector,
-            "cell": cell if cell != "All Cells" else "All Cells",
+            "cell": cell or "All Cells",
             "season": season,
             "stress_km2": round(stress_km2, 2),
             "stress_pct": round(stress_pct, 1),
             "baseline_ndvi": round(baseline_ndvi, 3),
             "ndmi_anomaly": round(ndmi_mean, 3),
             "satellite_coverage": n_images,
-            "alert_label": alert_label,
-            "logged_at": datetime.datetime.utcnow().isoformat()
+            "alert_level": alert_label,
         }
         supabase.table("alert_logs").insert(payload).execute()
-    except Exception as exc:
-        logger.warning(f"Supabase logging failed: {exc}")
+    except Exception:
+        pass
 
-def send_sms_alert(phone_number: str, message: str) -> tuple[bool, str]:
-    try:
-        username = get_secret("username", group="africastalking", default="sandbox")
-        api_key  = get_secret("api_key", group="africastalking")
-        
-        if not api_key:
-            return False, "SMS Error: Missing Africa's Talking API key in secrets."
-            
-        africastalking.initialize(username, api_key)
-        sms = africastalking.SMS
-        
-        response = sms.send(message=message, recipients=[phone_number])
-        recipients = response["SMSMessageData"]["Recipients"]
-        
-        if recipients and recipients[0]["status"] in ["Success", "Pending"]:
-            return True, f"Alert dispatched to {phone_number}!"
-        else:
-            return False, f"Failed: {recipients[0].get('status', 'Unknown error')}"
-    except Exception as exc:
-        return False, f"SMS Error: {exc}"
-
-def generate_html_report(district: str, sector: str, cell: str, season: str, stress_km2: float, stress_pct: float, total_cropland_km2: float, alert_label: str) -> str:
-    now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Agri-Scan Field Situation Report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 30px; color: #222; }}
-            h1 {{ color: #1b5e20; border-bottom: 2px solid #1b5e20; padding-bottom: 8px; }}
-            .card {{ background: #f8f9fa; border-left: 4px solid #1b5e20; padding: 12px; margin: 15px 0; }}
-            .metric {{ font-size: 22px; font-weight: bold; color: #d32f2f; }}
-        </style>
-    </head>
-    <body>
-        <h1>🌾 Agri-Scan Rwanda: Field Situation Report</h1>
-        <p><strong>Location:</strong> {district} ➔ {sector} ({cell or 'All Cells'})</p>
-        <p><strong>Season Window:</strong> {season} | <strong>Generated:</strong> {now_str}</p>
-        <div class="card">
-            <h3>Alert Level: {alert_label} RISK</h3>
-            <p>Cropland Under Stress: <span class="metric">{stress_km2:.2f} km² ({stress_pct:.1f}%)</span></p>
-            <p>Total Cropland Analyzed: {total_cropland_km2:.1f} km²</p>
-        </div>
-        <h3>Recommended Extension Actions:</h3>
-        <ul>
-            <li>Dispatch sector agronomists to perform ground-truth soil moisture verification.</li>
-            <li>Coordinate localized irrigation or supplementary mulching for high-risk zones.</li>
-            <li>Log localized findings to MINAGRI central repository.</li>
-        </ul>
-    </body>
-    </html>
-    """
-
-# ==============================================================================
-# 5. UI COMPONENTS: ESTIMATORS & PANELS
-# ==============================================================================
 def render_yield_impact_estimator(stress_km2: float, stress_pct: float):
+    """Calculates estimated crop monetary and yield losses."""
+    st.markdown("---")
     st.markdown("### 💰 Crop Loss & Yield Impact Estimator")
     if stress_km2 <= 0:
         st.info("No active cropland stress detected.")
@@ -330,164 +947,34 @@ def render_yield_impact_estimator(stress_km2: float, stress_pct: float):
         loss_severity = st.slider("Estimated Yield Loss Severity (%)", 10, 80, 30, step=5)
 
     params = crop_defaults[selected_crop]
-    stressed_ha = stress_km2 * 100
-    lost_tons = (stressed_ha * params["yield_ha"]) * (loss_severity / 100.0)
+    stressed_hectares = stress_km2 * 100
+    potential_yield_tons = stressed_hectares * params["yield_ha"]
+    lost_tons = potential_yield_tons * (loss_severity / 100.0)
     lost_rwf = lost_tons * 1000 * params["price_per_kg"]
 
     with c2:
         m1, m2, m3 = st.columns(3)
-        m1.metric("Stressed Area", f"{stressed_ha:,.0f} Ha")
+        m1.metric("Stressed Area", f"{stressed_hectares:,.0f} Ha")
         m2.metric("Est. Yield Loss", f"{lost_tons:,.1f} MT", delta=f"-{loss_severity}%", delta_color="inverse")
         m3.metric("Est. Economic Risk", f"{lost_rwf/1e6:,.1f}M RWF", delta="Potential Loss", delta_color="inverse")
 
-def render_sms_panel(district: str, sector: str, stress_km2: float, stress_pct: float):
-    st.markdown("---")
-    st.markdown("### 📱 Extension Officer SMS Dispatch")
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        phone = st.text_input("Recipient Phone Number", value="+250780000000")
-        dispatch_btn = st.button("🚀 Send SMS Alert")
-        
-    with col2:
-        sms_msg = f"Agri-Scan Alert [{district}-{sector}]: {stress_km2:.1f} km2 ({stress_pct:.1f}%) cropland under severe stress. Field verification requested."
-        st.text_area("Message Content", value=sms_msg, height=70, disabled=True)
-        
-    if dispatch_btn:
-        if not phone.startswith("+"):
-            st.error("Enter phone number in international format (e.g., +250...)")
-        else:
-            with st.spinner("Dispatching via Africa's Talking..."):
-                success, msg = send_sms_alert(phone, sms_msg)
-                if success:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-
-# ==============================================================================
-# 6. MAIN APPLICATION EXECUTION LOOP
-# ==============================================================================
-def main():
-    st.set_page_config(page_title="Agri-Scan Rwanda v4.1", page_icon="🌾", layout="wide")
-
-    st.title("🌾 Agri-Scan Rwanda: Crop Health & Climate Intelligence")
-    st.caption("Real-time Earth Observation & Food Security Monitoring — Sentinel-2 Z-Score · CHIRPS · SoilGrids · ESA WorldCover")
-
-    # ── SIDEBAR: ADMINISTRATIVE SELECTION ──
-    st.sidebar.header("📍 Administrative Selection")
-    district = st.sidebar.selectbox("District", list(PILOT_HIERARCHY.keys()), index=0)
-
-    available_sectors = ["All Sectors"] + list(PILOT_HIERARCHY[district].keys())
-    sector = st.sidebar.selectbox("Sector", available_sectors, index=0)
-
-    if sector != "All Sectors":
-        available_cells = ["All Cells"] + PILOT_HIERARCHY[district][sector]
-    else:
-        available_cells = ["All Cells"]
-    cell = st.sidebar.selectbox("Cell", available_cells, index=0)
-
-    # Date Range
-    st.sidebar.markdown("---")
-    st.sidebar.header("📅 Date Range")
-    start_date = st.sidebar.date_input("Start", datetime.date(2026, 1, 1)).strftime("%Y-%m-%d")
-    end_date = st.sidebar.date_input("End", datetime.date(2026, 9, 8)).strftime("%Y-%m-%d")
-
-    # Layer Selectors
-    st.sidebar.markdown("---")
-    st.sidebar.header("🗺️ Map Layers")
-    show_zscore = st.sidebar.checkbox("Crop Vigor Z-Score Anomaly (Sentinel-2)", value=True)
-    show_rain = st.sidebar.checkbox("Rainfall Anomaly % (CHIRPS)", value=False)
-    show_soc = st.sidebar.checkbox("Soil Organic Carbon (SoilGrids)", value=False)
-
-    roi, analysis_level, location_label, bbox_coords = build_roi(district, sector, cell)
-    st.sidebar.info(f"📍 **Analysis Level:** `{analysis_level.upper()}`\n\n**Unit:** {location_label}")
-
-    # Fetch Cached EO Analytics
-    with st.spinner("Processing Earth Observation layers..."):
-        metrics = compute_eo_metrics(district, sector, cell, start_date, end_date)
-
-    # Dynamic Alert Badging
-    alert_label = "HIGH" if metrics["stress_pct"] >= 15.0 else ("MODERATE" if metrics["stress_pct"] >= 5.0 else "LOW")
-    season_label = "Wet Season" if datetime.date.today().month in [2, 3, 4, 5, 10, 11, 12] else "Dry Season"
-
-    # Auto-log to Supabase
-    log_alert_to_supabase(
-        supabase=supabase_client,
-        district=district,
-        sector=sector,
-        cell=cell,
-        season=season_label,
-        stress_km2=metrics["stressed_km2"],
-        stress_pct=metrics["stress_pct"],
-        baseline_ndvi=metrics["baseline_ndvi"],
-        ndmi_mean=metrics["mean_ndmi"],
-        n_images=metrics["image_count"],
-        alert_label=alert_label
-    )
-
-    # ── TOP KPI CARDS ──
-    st.subheader(f"Selected Area: {district} ({season_label})")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Cropland Stress", f"{metrics['stressed_km2']:.1f} km² ({metrics['stress_pct']:.1f}%)", delta=f"{alert_label} Alert", delta_color="inverse")
-    k2.metric("Total Cropland Area", f"{metrics['total_cropland_km2']:.1f} km²", delta=f"Baseline NDVI {metrics['baseline_ndvi']}")
-    k3.metric("NDMI Anomaly (Water Content)", f"{metrics['mean_ndmi']:+.3f}")
-    k4.metric("Satellite Coverage", f"{metrics['image_count']} images", delta=f"Data Confidence: {metrics['data_confidence']}")
-
-    st.markdown("---")
-
-    # ── INTERACTIVE FOLIUM MAP ──
-    center_lat = (bbox_coords[1] + bbox_coords[3]) / 2.0
-    center_lon = (bbox_coords[0] + bbox_coords[2]) / 2.0
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="OpenStreetMap")
-
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-        attr="Google Satellite Hybrid",
-        name="Google Satellite Hybrid"
-    ).add_to(m)
-
-    if ee_available and roi:
-        folium.GeoJson(
-            roi.getInfo(),
-            name=f"Boundary ({analysis_level.capitalize()})",
-            style_function=lambda x: {"color": "#1b5e20", "weight": 3, "fillOpacity": 0.05}
-        ).add_to(m)
-
-    folium.LayerControl().add_to(m)
-    st_folium(m, width=1200, height=480)
-
-    # ── TIME SERIES PLOTLY CHART ──
-    st.markdown("---")
-    st.subheader("📈 Seasonal Vegetation Trend")
-    ts_df = fetch_time_series_data(district, sector, cell, start_date, end_date)
-    
-    fig = px.line(ts_df, x="Date", y=["NDVI", "Seasonal Baseline"], labels={"value": "NDVI Index", "variable": "Series"})
-    fig.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── SCENARIO ESTIMATOR & SMS DISPATCH ──
-    render_yield_impact_estimator(metrics["stressed_km2"], metrics["stress_pct"])
-    render_sms_panel(district, sector, metrics["stressed_km2"], metrics["stress_pct"])
-
-    # ── SIDEBAR EXPORTS ──
-    st.sidebar.markdown("---")
-    st.sidebar.header("📥 Export Options")
-    
-    summary_df = pd.DataFrame([metrics])
-    st.sidebar.download_button(
-        label="📊 Download Summary (CSV)",
-        data=summary_df.to_csv(index=False),
-        file_name=f"AgriScan_Summary_{district}_{sector}.csv",
-        mime="text/csv"
-    )
-
-    html_report = generate_html_report(district, sector, cell, season_label, metrics["stressed_km2"], metrics["stress_pct"], metrics["total_cropland_km2"], alert_label)
-    st.sidebar.download_button(
-        label="📄 Download Field Report (HTML)",
-        data=html_report,
-        file_name=f"AgriScan_Report_{district}_{sector}.html",
-        mime="text/html"
-    )
-
-if __name__ == "__main__":
-    main()
+def generate_html_report(district, sector, cell, season, stress_km2, stress_pct, total_cropland_km2, alert_label):
+    """Generates printable HTML situation report."""
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    location = f"{district} - {sector}" + (f" ({cell})" if cell else "")
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Field Situation Report - {location}</title></head>
+    <body style="font-family: Arial, sans-serif; margin: 30px; color: #222;">
+        <h1 style="color: #1b5e20;">🌾 Agri-Scan Rwanda: Field Situation Report</h1>
+        <p><strong>Location:</strong> {location}</p>
+        <p><strong>Season:</strong> {season} | <strong>Generated:</strong> {now_str}</p>
+        <hr/>
+        <h3>Alert Overview</h3>
+        <p><strong>Status:</strong> {alert_label} RISK</p>
+        <p><strong>Stressed Area:</strong> {stress_km2:.2f} km² ({stress_pct:.1f}%)</p>
+        <p><strong>Total Cropland Analyzed:</strong> {total_cropland_km2:.1f} km²</p>
+    </body>
+    </html>
+    """
