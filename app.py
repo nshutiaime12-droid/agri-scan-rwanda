@@ -8,7 +8,6 @@ import pandas as pd
 import ee
 import folium
 from streamlit_folium import st_folium
-import geemap.foliumap as geemap
 from supabase import create_client, Client
 
 logger = logging.getLogger("agri_scan")
